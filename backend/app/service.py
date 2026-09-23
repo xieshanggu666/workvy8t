@@ -15,6 +15,7 @@ from . import shop as shop_mod
 from . import commissions as commission_mod
 from . import potions as potions_mod
 from . import companions as companions_mod
+from . import encounters as quest_mod
 from .cards import all_cards, get_card
 from .engine import Battle, _statuses_public
 from .forging import FORGE_COST, effective_card, node_name, growth_node_cost, validate_unlock
@@ -57,10 +58,19 @@ from .settlement import EffectEvent, SettlementQueue
 #        新规则；回放 2.7.0 之前日志时对越过修复点之前的战斗动作启用旧时序
 #        （legacy_block：敌人行动前清格挡 + 按全额援护），历史动作逐位可重演，
 #        跨越修复点后严格校验，续局与回放不分叉。
-RULES_VERSION = "2.7.0"
+# 2.8.0：跨章节奇遇链——地图新增「奇遇」节点（固定槽位），抉择立即承担代价
+#        （生命/金币），选择写入随远征跨章继承的奇遇状态（quests：开放链/分支
+#        标记/访问序），后续章节按选择触发伏击战斗（ambush）或直接奖励
+#        （牌组/遗物/金币/生命，复用统一效果结算回写）；本地小奇遇不跨章。
+#        奇遇状态进入 run 状态与交接快照，旧档缺字段时首次载入 setdefault 空
+#        状态（结构迁移，本步按 legacy 处理）；quest_choose 是普通动作，走
+#        request_id 幂等 + expected_rev + 单事务原子提交，续局与版本化回放
+#        逐位一致。
+RULES_VERSION = "2.8.0"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
 COMPANION_RULES_VERSION = "2.6.0"  # 伙伴字段进入 run 状态：更早日志的迁移步前按 legacy 比对
 BLOCK_RULES_VERSION = "2.7.0"  # 格挡/援护结算顺序修复：更早日志的战斗动作走旧时序重演
+QUEST_RULES_VERSION = quest_mod.QUEST_RULES_VERSION  # 2.8.0 奇遇链状态进入 run 状态
 
 
 def _ver_lt(ver, baseline):
@@ -132,6 +142,7 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
             "max_health": 75, "health": 75, "base_energy": 3,
             "potions": [],
             "companion": None,
+            "quests": quest_mod.new_quest_state(),
         }
         heal = 0
     else:
@@ -160,6 +171,10 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         # 远征委托：uid 单调发号器 + 委托实例（接取/进度/领奖/超期/战败失败）
         "next_commission_seq": carry.get("next_commission_seq", 1),
         "commissions": copy.deepcopy(carry.get("commissions", [])),
+        # 跨章奇遇链：已开放链（分支标记/当前幕/终态）+ 各章奇遇节点访问序，
+        # 随章节交接快照完整继承；普通局为独立的空状态（本地奇遇仍可触发）。
+        "quests": copy.deepcopy(carry.get("quests") or quest_mod.new_quest_state()),
+        "quest_event": None,          # 当前奇遇节点待处理的幕（抉择/伏击），离开即清
         # 远征归属（普通局均为 None）：新章 run 的身份只认真实入参；carry 的
         # chapter/chapters_total 是来源章快照，不参与新 run 的身份判定。
         "expedition_id": expedition_id,
@@ -264,6 +279,16 @@ def _migrate_state(run):
     elif companion_changed:
         run["companion"] = companion
         changed = True
+    # 2.8.0：跨章奇遇链（旧档无此字段，空状态开局；结构变化随本步原子落库）
+    quests, quests_changed = quest_mod.normalize_state(run.get("quests"))
+    if "quests" not in run:
+        run["quests"] = quests
+        run["quest_event"] = None
+        changed = True
+    elif quests_changed:
+        run["quests"] = quests
+        changed = True
+    run.setdefault("quest_event", None)
     return changed
 
 
@@ -316,6 +341,9 @@ def _carry_from_run(run):
         "companion": copy.deepcopy(run.get("companion")),
         "commissions": copy.deepcopy(run.get("commissions", [])),
         "next_commission_seq": run.get("next_commission_seq", 1),
+        # 跨章奇遇链：开放链/分支标记/访问序随快照带入下一章（quest_event 是
+        # 节点级待办，不随章携带——新章从「start」起，需重新进入奇遇节点触发）
+        "quests": copy.deepcopy(run.get("quests") or quest_mod.new_quest_state()),
         "chapter": run.get("chapter"),
         "chapters_total": run.get("chapters_total"),
     }
@@ -353,6 +381,9 @@ def _carry_public(carry):
         "max_health": carry.get("max_health"),
         "potions": [potions_mod.public_potion(pid) for pid in carry.get("potions", [])],
         "companion": companions_mod.public_companion(carry.get("companion")),
+        "quests": quest_mod.chains_public(
+            carry.get("quests") or quest_mod.new_quest_state(),
+            carry.get("chapter") or 0),
         "commissions": [
             commission_mod.commission_public(c, carry.get("chapter") or 0)
             for c in carry.get("commissions", [])
@@ -834,8 +865,9 @@ def _enemy_by_node(node_data):
 
 
 # ---------- 战斗绑定 ----------
-def _build_battle(run_state, node_data):
-    enemy_def = _enemy_by_node(node_data)
+def _build_battle(run_state, node_data, ambush_enemy=None):
+    # 奇遇链伏击：敌人来自奇遇幕定义而非地图节点（节点本身是 event 类型）
+    enemy_def = enemies_mod.get_enemy(ambush_enemy) if ambush_enemy else _enemy_by_node(node_data)
     relic = run_state["relics"]
     boss_hp_bonus = 0
     if node_data["type"] == mapgen.BOSS and "boss_hp_bonus" in relic:
@@ -974,6 +1006,7 @@ def act(run_id, action):
                 "slot": action.get("slot"),
                 "replace": action.get("replace"),
                 "mode": action.get("mode"),
+                # quest_choose 与 claim_reward 共用 option 字段，action 区分语义
                 "ver": RULES_VERSION, "ckpt": state_checkpoint(run),
             }
             if migrated:
@@ -1045,6 +1078,8 @@ def _apply_action(run, a, action, map_data, grant_unlocks=False):
                                   legacy_ignore_cap=action.get("_legacy_ignore_cap", False))
     if a == "commission_claim":
         return _commission_claim(run, action.get("commission"))
+    if a == "quest_choose":
+        return _quest_choose(run, action.get("option"))
     raise InvalidAction(f"unknown action {a}")
 
 
@@ -1057,6 +1092,8 @@ def _choose_node(run, map_data, node, grant_unlocks=True):
     initial_log = []
     # 每进入一个新节点都清掉上个节点的商店库存（商店仅在其节点内有效）
     run["shop"] = None
+    # 奇遇待办只存活于其节点内：一旦离开（去战斗节点/伏击胜利后继续推进）即清空
+    run["quest_event"] = None
 
     t = node_data["type"]
     if t in (mapgen.ENCOUNTER, mapgen.ELITE, mapgen.BOSS):
@@ -1130,7 +1167,164 @@ def _choose_node(run, map_data, node, grant_unlocks=True):
     elif t == "start":
         run["reward_claimed"] = True
         run["forge_claimed"] = True
+    elif t == mapgen.EVENT:
+        # 奇遇节点（2.8.0）：确定性解析为本章等待触发的跨章链幕或本地小奇遇。
+        # 抉择幕等待 quest_choose；伏击幕立即开战；奖励幕进入即自动结算。
+        # 旧档安全：回放与在线都用持久化存档地图，2.8.0 之前的 run 地图里
+        # 根本没有 event 节点，无需为旧日志特判。
+        return _enter_quest_node(run, node, grant_unlocks=grant_unlocks)
     return initial_log
+
+
+def _enter_quest_node(run, node, grant_unlocks=True):
+    """进入奇遇节点：解析奇遇幕并按类型（抉择/伏击/奖励）分发。纯推演。"""
+    quests = run.setdefault("quests", quest_mod.new_quest_state())
+    chapter = run.get("chapter") or 1
+    event, rec = quest_mod.resolve_event(quests, chapter, node)
+    if rec is not None:
+        rec.setdefault("log", []).append(
+            {"chapter": chapter, "step": rec["step"], "node": node})
+    run["reward_options"] = []
+    run["reward_claimed"] = True
+    run["forge_claimed"] = True
+    log = [{"quest_event": _quest_event_log(event)}]
+
+    if event["kind"] == quest_mod.CHOICE:
+        # 待玩家抉择（本地奇遇选完即了；链首抉择才会真正开放链——resolve_event
+        # 已经把新链加入 quests，选「离开」类选项时 advance_chain 直接置 closed）
+        run["in_battle"] = False
+        run["battle"] = None
+        run["quest_event"] = event
+        return log
+
+    if event["kind"] == quest_mod.REWARD:
+        # 奖励幕：唯一「领取」选项，进入即自动结算（牌组/遗物/金币/生命回写）
+        return _settle_quest_reward(run, event, rec, log)
+
+    if event["kind"] == quest_mod.AMBUSH:
+        # 伏击幕：立即与奇遇敌人开战；胜利效果在战后 _after_battle_step 结算
+        ambush = quest_mod.ambush_for(event)
+        rec["ambush"] = {"enemy": ambush["enemy"], "win": list(ambush.get("win", []))}
+        run["quest_event"] = event
+        run["in_battle"] = True
+        run["battle_index"] += 1
+        battle, companion_log = _build_battle(
+            run, {"type": mapgen.ENCOUNTER}, ambush_enemy=ambush["enemy"])
+        log.extend(companion_log)
+        if battle.battle_result() != "ongoing":
+            return _after_battle_step(run, battle, log, grant_unlocks=grant_unlocks)
+        run["battle"] = battle.dump()
+        run["health"] = battle.entities["player"]["hp"]
+        _sync_companion_from_battle(run, battle)
+        log.append({"snapshot": battle.to_snapshot()})
+        run["events_log"].append(
+            {"at": f"quest_ambush:{node}:{run['battle_index']}", "battle": True,
+             "chain": event.get("chain"), "step": event.get("step")})
+        return log
+
+    raise InvalidAction(f"unknown quest event kind: {event['kind']}")
+
+
+def _quest_event_log(event):
+    """动作日志里的奇遇幕标记（前端横幅 + 回放可读）。"""
+    out = {"scope": event["scope"], "kind": event["kind"],
+           "title": event["title"], "text": event["text"]}
+    if event.get("chain"):
+        out["chain"] = event["chain"]
+        out["step"] = event["step"]
+        out["name"] = event.get("name")
+        out["icon"] = event.get("icon")
+    if event.get("ambush"):
+        out["ambush"] = event["ambush"]
+    return out
+
+
+def _settle_quest_reward(run, event, rec, log):
+    """奖励幕自动结算：应用唯一选项的效果（复用统一效果回写牌组/遗物/生命/金币）。"""
+    options = event.get("options", [])
+    option_def = None
+    if rec is not None:
+        step = quest_mod.step_def(rec["chain"], rec["step"])
+        option_def = step["options"][0]
+    elif options:
+        le = next((e for e in quest_mod.LOCAL_EVENTS if e["key"] == event["key"]), None)
+        option_def = le["options"][0] if le else None
+    granted = []
+    if option_def:
+        granted = list(_apply_quest_effects(run, option_def.get("effects", [])))
+    if rec is not None:
+        quest_mod.resolve_reward(rec)
+    run["quest_event"] = None
+    run["events_log"].append(
+        {"at": f"quest:{run['position']}", "chain": event.get("chain"),
+         "step": event.get("step"), "granted": granted})
+    log.append({"quest_resolved": {
+        "chain": event.get("chain"), "step": event.get("step"),
+        "scope": event["scope"], "title": event["title"], "granted": granted}})
+    return log
+
+
+def _apply_quest_effects(run, effects):
+    """奇遇效果复用统一回写通道（add_card/gold/heal_run/relic_set）。返回发放摘要。"""
+    granted = []
+    for eff in effects:
+        t = eff.get("type")
+        if t == "add_card":
+            uid = _add_card_instance(run, eff["card"])
+            granted.append({"type": "card", "card": eff["card"], "uid": uid})
+        elif t == "gold":
+            run["gold"] += eff["value"]
+            granted.append({"type": "gold", "amount": eff["value"]})
+        elif t == "heal_run":
+            run["health"] = min(run["max_health"], run["health"] + eff["value"])
+            granted.append({"type": "heal", "amount": eff["value"]})
+        elif t == "relic_set":
+            run["relics"][eff["relic"]] = eff.get("value", 1)
+            granted.append({"type": "relic", "relic": eff["relic"]})
+        else:
+            # 与 _apply_option_effect 保持一致：未知效果交统一通道兜底
+            _apply_option_effect(run, eff)
+            granted.append({"type": t})
+    return granted
+
+
+def _quest_choose(run, option_idx):
+    """玩家在奇遇抉择幕作出选择并承担代价（普通动作，request_id 幂等 + 事务原子）。
+
+    代价（生命/金币）先校验后扣除，失败零副作用；抉择效果（金币/卡牌/治疗）
+    经统一通道回写。本地奇遇选完即清空待办；跨章链按 option.next 开放下一幕
+    （后续章节才触发）或立即终结。
+    """
+    quests = run.setdefault("quests", quest_mod.new_quest_state())
+    try:
+        event, rec, option_def, paid = quest_mod.choose(quests, run, option_idx)
+    except quest_mod.QuestError as e:
+        raise InvalidAction(str(e))
+
+    granted = list(_apply_quest_effects(run, option_def.get("effects", [])))
+    if rec is None:
+        # 本地小奇遇：不产生跨章状态
+        run["quest_event"] = None
+    else:
+        moved = quest_mod.advance_chain(rec, option_def)
+        rec.setdefault("log", []).append(
+            {"chapter": run.get("chapter") or 1, "step": rec["step"],
+             "choice": rec["choice"], "status": rec["status"],
+             "paid": paid, "granted": granted})
+        run["quest_event"] = None
+        run["events_log"].append(
+            {"at": f"quest:{run['position']}", "chain": rec["chain"],
+             "step": event.get("step"), "choice": rec["choice"],
+             "next": moved["step"], "status": moved["status"],
+             "paid": paid, "granted": granted})
+    log = [{"quest_choice": {
+        "chain": event.get("chain"), "step": event.get("step"),
+        "scope": event["scope"], "title": event["title"],
+        "option": option_idx, "text": option_def["text"],
+        "paid": paid, "granted": granted,
+        "chain_status": rec["status"] if rec else "local",
+        "next_step": rec["step"] if rec else None}}]
+    return log
 
 
 def _battle_or_raise(run):
@@ -1297,8 +1491,12 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
 
     # 战斗结束
     run["in_battle"] = False
+    # 奇遇链伏击：敌人/胜利效果由奇遇幕携带（非地图节点战，战败同样终结远征）
+    ambush_ctx = _pending_ambush(run)
     if result == "won":
         run["battle"] = None
+        if ambush_ctx is not None:
+            return _after_quest_ambush_won(run, battle, log, ambush_ctx, grant_unlocks)
         # 用当前节点敌人掉落生成奖励
         enemy = battle.enemy_def
         # 2.5.0 之前的旧战斗不出药水战利品：回放旧日志时按旧选项集重建，
@@ -1321,6 +1519,13 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
         run["battle"] = None
         run["status"] = "lost"
         log.append({"result": "lost", "snapshot": snap})
+        # 奇遇伏击战败：链停留在失败的伏击幕（远征即将结算，仅用于轨迹可读）
+        if ambush_ctx is not None:
+            ambush_ctx.setdefault("log", []).append(
+                {"chapter": run.get("chapter") or 1, "step": ambush_ctx["step"],
+                 "choice": "ambush_lost"})
+            log.append({"quest_ambush_lost": {
+                "chain": ambush_ctx["chain"], "step": ambush_ctx["step"]}})
         # 远征委托：战败则所有进行中委托立即失败
         _progress_commissions(run, commission_mod.apply_battle_result(
             run.get("commissions", []), False), log, "battle_lost")
@@ -1329,6 +1534,46 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
             new_profile, changed = _grant_unlock_on_loss(run)
             if changed:
                 run[_PENDING_UNLOCK_KEY] = new_profile
+    return log
+
+
+def _pending_ambush(run):
+    """若当前战斗是奇遇链伏击，返回对应的链记录（含胜利效果）；否则 None。"""
+    event = run.get("quest_event")
+    if not event or event.get("kind") != quest_mod.AMBUSH:
+        return None
+    rec = next((c for c in run.get("quests", {}).get("chains", [])
+                if c["chain"] == event.get("chain") and c["step"] == event.get("step")
+                and c.get("ambush")), None)
+    return rec
+
+
+def _after_quest_ambush_won(run, battle, log, rec, grant_unlocks):
+    """奇遇伏击胜利的战后结算：
+
+    - 不开普通战利品（伏击的「奖励」是链定义里的胜利效果）；
+    - 胜利效果经统一通道回写牌组/遗物/金币/生命；
+    - 链置 resolved、待办清空，玩家停在该奇遇节点可继续选路；
+    - 委托讨伐目标照常推进（这确实是一场打赢的战斗）。
+    """
+    snap = battle.to_snapshot()
+    win_effects = quest_mod.resolve_ambush(rec)
+    granted = list(_apply_quest_effects(run, win_effects))
+    rec.setdefault("log", []).append(
+        {"chapter": run.get("chapter") or 1, "step": rec["step"],
+         "choice": "ambush_won", "granted": granted})
+    run["quest_event"] = None
+    run["reward_options"] = []
+    run["reward_claimed"] = True
+    run["events_log"].append(
+        {"at": f"quest_ambush:{run['position']}", "chain": rec["chain"],
+         "step": rec["step"], "won": True, "granted": granted})
+    log.append({"result": "won", "snapshot": snap})
+    _progress_commissions(run, commission_mod.apply_battle_result(
+        run.get("commissions", []), True), log, "battle_win")
+    log.append({"quest_resolved": {
+        "chain": rec["chain"], "step": rec["step"], "scope": "chain",
+        "ambush": True, "granted": granted}})
     return log
 
 
@@ -1786,16 +2031,19 @@ def resume(run_id):
 _PENDING_UNLOCK_KEY = "_pending_unlock"
 _LEGACY_NO_COMPANION_KEY = "_legacy_no_companion"
 _LEGACY_NO_POTIONS_KEY = "_legacy_no_potions"
+_LEGACY_NO_QUESTS_KEY = "_legacy_no_quests"
 # 仅存在于回放内存 run：当前是否仍处于 2.7.0 之前的旧格挡时序（不写入存档、
 # 不参与校验点哈希）。_load_battle 据此给 Battle 置 legacy_block。
 _LEGACY_BLOCK_KEY = "_legacy_block"
 _CKPT_SKIP_KEYS = {
     "events_log", _PENDING_UNLOCK_KEY, _LEGACY_NO_COMPANION_KEY,
-    _LEGACY_NO_POTIONS_KEY, _LEGACY_BLOCK_KEY, "_ckpt_skip_keys",
+    _LEGACY_NO_POTIONS_KEY, _LEGACY_NO_QUESTS_KEY, _LEGACY_BLOCK_KEY,
+    "_ckpt_skip_keys",
 }
 
 
-def state_checkpoint(run, include_companion=True, include_potions=True):
+def state_checkpoint(run, include_companion=True, include_potions=True,
+                     include_quests=True):
     """权威状态校验点：对完整 run 状态取稳定哈希（SHA-256 截断 16 位）。
 
     include_*=False 仅用于旧规则升级时的历史初态/迁移前哈希兼容。
@@ -1805,6 +2053,9 @@ def state_checkpoint(run, include_companion=True, include_potions=True):
         skip.add("companion")
     if not include_potions:
         skip.add("potions")
+    if not include_quests:
+        skip.add("quests")
+        skip.add("quest_event")
     material = {k: v for k, v in run.items() if k not in skip}
     blob = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -1832,7 +2083,10 @@ def _create_ckpt_candidates(seed, create_payload):
     full_ckpt = state_checkpoint(sim)
     no_companion_ckpt = state_checkpoint(sim, include_companion=False)
     no_potions_ckpt = state_checkpoint(sim, include_potions=False)
+    no_quests_ckpt = state_checkpoint(sim, include_quests=False)
     legacy_shape_ckpt = state_checkpoint(sim, include_companion=False, include_potions=False)
+    legacy_full_ckpt = state_checkpoint(
+        sim, include_companion=False, include_potions=False, include_quests=False)
     buggy = None
     if carry is not None and chapter is not None and chapter > 1:
         buggy = _new_run_state(
@@ -1848,8 +2102,13 @@ def _create_ckpt_candidates(seed, create_payload):
                          if buggy is not None else None, no_companion_ckpt),
         "no_potions": (state_checkpoint(buggy, include_potions=False)
                        if buggy is not None else None, no_potions_ckpt),
+        "no_quests": (state_checkpoint(buggy, include_quests=False)
+                      if buggy is not None else None, no_quests_ckpt),
         "legacy_shape": (state_checkpoint(buggy, include_companion=False, include_potions=False)
                          if buggy is not None else None, legacy_shape_ckpt),
+        "legacy_full": (state_checkpoint(buggy, include_companion=False,
+                                         include_potions=False, include_quests=False)
+                        if buggy is not None else None, legacy_full_ckpt),
     }
     recorded = create_payload.get("ckpt") if not create_payload.get("_corrupt") else None
     matched_shape = "full"
@@ -1862,9 +2121,10 @@ def _create_ckpt_candidates(seed, create_payload):
                 matched_buggy_ckpt = buggy_hash
                 fixed_ckpt = recorded
                 break
-    pre_companion = matched_shape in ("no_companion", "legacy_shape")
-    pre_potions = matched_shape in ("no_potions", "legacy_shape")
-    return sim, fixed_ckpt, matched_buggy_ckpt, pre_companion, pre_potions
+    pre_companion = matched_shape in ("no_companion", "legacy_shape", "legacy_full")
+    pre_potions = matched_shape in ("no_potions", "legacy_shape", "legacy_full")
+    pre_quests = matched_shape in ("no_quests", "legacy_full")
+    return sim, fixed_ckpt, matched_buggy_ckpt, pre_companion, pre_potions, pre_quests
 
 
 def _replay_commission_maps(conn, exp_id, run_id):
@@ -1946,13 +2206,16 @@ def replay(run_id):
     )
     # 修复后正确初态 + 旧版错误初态两个候选：用记录的 create ckpt 识别受影响旧日志
     (sim, initial_ckpt, buggy_ckpt,
-     pre_companion_create, pre_potions_create) = _create_ckpt_candidates(seed, create_payload)
+     pre_companion_create, pre_potions_create,
+     pre_quests_create) = _create_ckpt_candidates(seed, create_payload)
     recorded_initial = (create_payload.get("ckpt")
                         if not create_payload.get("_corrupt") else None)
     pre_companion_replay = pre_companion_create
     pre_potions_replay = pre_potions_create
+    pre_quests_replay = pre_quests_create
     companion_migration_seen = not pre_companion_replay
     potions_migration_seen = not pre_potions_replay
+    quests_migration_seen = not pre_quests_replay
     # 2.7.0 格挡/援护顺序修复：无存档结构变更，create 形状无法区分新旧——
     # 统一按「首个 2.7.0+ 动作之前为旧时序」处理。在线路径上旧战斗中存档
     # 在玩家回合边界落库，升级后的首个动作（可能直接就是 end_turn）即按新
@@ -1998,6 +2261,12 @@ def replay(run_id):
         sim["potions"] = []
         if sim.get("shop"):
             sim["shop"].pop("potions", None)
+    if pre_quests_replay:
+        # 2.8.0 之前的旧初态不含 quests/quest_event；迁移点之前按旧形状比对，
+        # 且旧地图（持久化）没有 event 节点，奇遇规则不会被触发。
+        sim[_LEGACY_NO_QUESTS_KEY] = True
+        sim.pop("quests", None)
+        sim.pop("quest_event", None)
     # 远征章节 run：帧视口携带远征摘要（只读，不阻断回放）
     exp_badge = None
     if rec.get("expedition_id"):
@@ -2036,6 +2305,9 @@ def replay(run_id):
         crossing_potions = (a != "create" and pre_potions_replay
                             and not potions_migration_seen
                             and ver and not _ver_lt(ver, "2.5.0"))
+        crossing_quests = (a != "create" and pre_quests_replay
+                           and not quests_migration_seen
+                           and ver and not _ver_lt(ver, QUEST_RULES_VERSION))
         # 格挡规则修复点：首个携带 2.7.0+ 版本的动作（含战斗动作）之前一切
         # 按旧格挡时序推演；本动作本身在线上已是修复后语义（规则先行切换）。
         crossing_block = (a != "create" and not block_rule_seen
@@ -2044,8 +2316,10 @@ def replay(run_id):
         # 按 legacy 修复路径重放；越过该点后恢复严格校验。
         at_fix_point = (legacy_chapter and not post_fix and a != "create"
                         and (migrated_step or (ver and not _ver_lt(ver, RULES_VERSION))
-                             or crossing_companion or crossing_potions or crossing_block))
-        if at_fix_point or crossing_companion or crossing_potions or crossing_block:
+                             or crossing_companion or crossing_potions
+                             or crossing_quests or crossing_block))
+        if (at_fix_point or crossing_companion or crossing_potions
+                or crossing_quests or crossing_block):
             if crossing_companion:
                 companion_migration_seen = True
                 sim.pop(_LEGACY_NO_COMPANION_KEY, None)
@@ -2054,12 +2328,17 @@ def replay(run_id):
                 potions_migration_seen = True
                 sim.pop(_LEGACY_NO_POTIONS_KEY, None)
                 sim.setdefault("potions", [])
+            if crossing_quests:
+                quests_migration_seen = True
+                sim.pop(_LEGACY_NO_QUESTS_KEY, None)
+                sim.setdefault("quests", quest_mod.new_quest_state())
+                sim.setdefault("quest_event", None)
             if crossing_block:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
         if at_fix_point:
             post_fix = True
-            # 2.4.0 修复点会同时越过伙伴/药水迁移（首个当前版本事件不可能早于它们）
+            # 2.4.0 修复点会同时越过伙伴/药水/奇遇迁移（首个当前版本事件不早于它们）
             if not companion_migration_seen:
                 companion_migration_seen = True
                 sim.pop(_LEGACY_NO_COMPANION_KEY, None)
@@ -2068,6 +2347,11 @@ def replay(run_id):
                 potions_migration_seen = True
                 sim.pop(_LEGACY_NO_POTIONS_KEY, None)
                 sim.setdefault("potions", [])
+            if not quests_migration_seen:
+                quests_migration_seen = True
+                sim.pop(_LEGACY_NO_QUESTS_KEY, None)
+                sim.setdefault("quests", quest_mod.new_quest_state())
+                sim.setdefault("quest_event", None)
             if not block_rule_seen:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
@@ -2082,6 +2366,8 @@ def replay(run_id):
                               and a != "create")
         pre_potions_step = (pre_potions_replay and not potions_migration_seen
                             and a != "create")
+        pre_quests_step = (pre_quests_replay and not quests_migration_seen
+                           and a != "create")
         # 仍处于旧格挡时序区间的步骤（2.7.0 修复点之前）：同一动作在旧时序下
         # 的落库状态与新推演不同（格挡/承伤/伙伴生命），按 legacy 呈现并跳过
         # 哈希比对；动作仍经 legacy_block 旧时序逐位重演。纯规则修复、无结构
@@ -2096,9 +2382,10 @@ def replay(run_id):
         is_legacy = not ver
         skip_ckpt = (corrupt_row or migrated_step or pre_repair
                      or create_of_legacy or pre_companion_step or pre_potions_step
-                     or pre_block_step)
+                     or pre_quests_step or pre_block_step)
         if (is_legacy or migrated_step or pre_repair or create_of_legacy
-                or pre_companion_step or pre_potions_step or pre_block_step):
+                or pre_companion_step or pre_potions_step or pre_quests_step
+                or pre_block_step):
             legacy_steps += 1
         if pre_repair:
             repaired_steps += 1
@@ -2154,6 +2441,7 @@ def replay(run_id):
             sim,
             include_companion=not pre_companion_step,
             include_potions=not pre_potions_step,
+            include_quests=not pre_quests_step,
         )
         if error:
             status = "error"
@@ -2183,7 +2471,7 @@ def replay(run_id):
             "check": status,
             "legacy": (is_legacy or migrated_step or pre_repair
                        or create_of_legacy or pre_companion_step or pre_potions_step
-                       or pre_block_step),
+                       or pre_quests_step or pre_block_step),
             "migrated": migrated_step,
             "repaired": pre_repair,
             "error": error,
@@ -2241,6 +2529,8 @@ def _step_kind(sim, action, payload, log):
         return "trade"
     if action in ("commission_accept", "commission_claim"):
         return "commission"
+    if action == "quest_choose":
+        return "quest"
     if action == "discard_potion":
         return "potion"
     if action == "companion_set_mode":
@@ -2255,7 +2545,8 @@ def _node_label(map_data, node):
         return ""
     nd = map_data["nodes"].get(node)
     labels = {"encounter": "遭遇", "elite": "精英", "rest": "休息", "reward": "奖励",
-              "forge": "锻造", "shop": "商店", "boss": "首领", "start": "营地"}
+              "forge": "锻造", "shop": "商店", "event": "奇遇", "boss": "首领",
+              "start": "营地"}
     return labels.get((nd or {}).get("type"), node)
 
 
@@ -2270,6 +2561,12 @@ def _step_title(sim, map_data, action, payload, log):
         return "建局"
     if action == "choose_node":
         node = payload.get("node")
+        qev = next((x.get("quest_event") for x in log
+                    if isinstance(x, dict) and x.get("quest_event")), None)
+        if qev and qev.get("kind") != "none":
+            if qev.get("kind") == quest_mod.AMBUSH:
+                return f"{qev.get('icon', '⚔️')} 奇遇伏击 · {qev.get('title', '')}"
+            return f"{qev.get('icon', '✨')} 奇遇 · {qev.get('title', '')}"
         return f"前往{_node_label(map_data, node)}节点"
     if action == "play":
         inst = sim.get("card_instances", {}).get(payload.get("card"))
@@ -2304,6 +2601,13 @@ def _step_title(sim, map_data, action, payload, log):
         return "接取远征委托"
     if action == "commission_claim":
         return "领取委托奖励"
+    if action == "quest_choose":
+        qc = next((x.get("quest_choice") for x in log
+                   if isinstance(x, dict) and x.get("quest_choice")), None)
+        if qc:
+            prefix = f"{qc.get('icon', '')} " if qc.get("scope") == "chain" else "✨ "
+            return f"{prefix}{qc.get('title', '奇遇')} · {qc.get('text', '作出抉择')}"
+        return "奇遇抉择"
     if action == "use_potion":
         used = next((x.get("potion") for x in log
                      if isinstance(x, dict) and x.get("potion")), None)
@@ -2371,6 +2675,43 @@ def _step_summary(action, payload, log):
             if g["type"] == "gold":
                 return f"获得金币 {g['amount']}（余额 {g['gold']}）"
             return f"获得卡牌「{_card_name(g['card'])}」"
+    if action == "quest_choose":
+        qc = next((x.get("quest_choice") for x in log
+                   if isinstance(x, dict) and x.get("quest_choice")), None)
+        if qc:
+            parts = []
+            for p in qc.get("paid", []):
+                if "hp" in p:
+                    parts.append(f"-{p['hp']} 生命")
+                if "gold" in p:
+                    parts.append(f"-{p['gold']} 金币")
+            for g in qc.get("granted", []):
+                if g.get("type") == "gold":
+                    parts.append(f"+{g['amount']} 金币")
+                elif g.get("type") == "card":
+                    parts.append(f"获得卡牌「{_card_name(g['card'])}」")
+                elif g.get("type") == "heal":
+                    parts.append(f"回复 {g['amount']} 生命")
+                elif g.get("type") == "relic":
+                    parts.append("获得遗物")
+            tail = "；".join(parts)
+            if qc.get("chain_status") == "open":
+                tail = (tail + "；" if tail else "") + "因果将在后续章节显现"
+            return tail
+        return ""
+    if action == "choose_node":
+        qr = next((x.get("quest_resolved") for x in log
+                   if isinstance(x, dict) and x.get("quest_resolved")), None)
+        if qr:
+            parts = []
+            for g in qr.get("granted", []):
+                if g.get("type") == "gold":
+                    parts.append(f"+{g['amount']} 金币")
+                elif g.get("type") == "card":
+                    parts.append(f"获得卡牌「{_card_name(g['card'])}」")
+                elif g.get("type") == "relic":
+                    parts.append("获得遗物")
+            return f"奇遇结算：{'，'.join(parts)}" if parts else "奇遇已了结"
     if action == "claim_reward":
         for x in log:
             if isinstance(x, dict) and x.get("reward_claimed"):
@@ -2384,6 +2725,15 @@ def _step_summary(action, payload, log):
     if action == "choose_node" and payload.get("node"):
         return f"位置 → {payload['node']}"
     return ""
+
+
+def _quest_event_public(event):
+    """当前奇遇节点待办幕的只读视口（None 表示不在抉择/伏击中）。"""
+    if not event:
+        return None
+    out = dict(event)
+    # 内部判定字段不影响前端；options 已在 encounters 内转公开形态
+    return out
 
 
 def _growth_public(inst):
@@ -2493,6 +2843,12 @@ def _public_view(run, map_data, run_id, include_unlocks=True, rev=None, expediti
             for c in run.get("commissions", [])
         ],
         "commission_kinds": commission_mod.public_commission_kinds(),
+        # 跨章奇遇链：当前节点待抉择/待打的幕 + 侧栏链追踪（开放链/终态/后续预告）
+        "quest_event": _quest_event_public(run.get("quest_event")),
+        "quests": quest_mod.chains_public(
+            run.get("quests") or quest_mod.new_quest_state(),
+            run.get("chapter") or 1),
+        "quest_catalog": quest_mod.quest_catalog(),
         "in_battle": run["in_battle"],
         "battle": snap,
         "reachable": [map_data["nodes"][n] for n in reachable],

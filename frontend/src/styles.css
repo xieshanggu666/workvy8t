@@ -109,6 +109,7 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 .mnode.reward { border-color: #ffd166; }
 .mnode.forge { border-color: #7fd1ff; }
 .mnode.shop { border-color: #5be0b0; }
+.mnode.event { border-color: #c08cff; }
 .mnode.rest { border-color: #4cd964; }
 .mnode.boss { border-color: #e04850; }
 .mnode.reachable { color: #fff; box-shadow: 0 0 0 1px #7d3cff; cursor: pointer; }
@@ -449,3 +450,39 @@ button.mini { font-size: 12px; padding: 4px 8px; }
   gap: 8px;
 }
 .battle-companion.down { opacity: .55; border-color: #704048; }
+
+/* 跨章节奇遇链（2.8.0） */
+.quest-panel { border-color: #c08cff; }
+.quest-panel.ambush { border-color: #e04850; }
+.quest-title { font-weight: 600; margin: 4px 0; }
+.quest-text { color: #c9c9dd; font-size: 13px; line-height: 1.6; }
+.quest-hint { color: #ffb27a; font-size: 12px; }
+.quest-options { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.quest-option {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  text-align: left; padding: 10px 12px; background: #26263a;
+  border: 1px solid #3a3a55; border-radius: 8px; color: #eee; cursor: pointer;
+}
+.quest-option:hover:not(:disabled) { border-color: #c08cff; background: #2c2c44; }
+.quest-option:disabled { opacity: .6; cursor: default; }
+.quest-option-text { font-size: 13px; }
+.quest-option-hint { font-size: 11px; color: #9a9ab5; }
+.quest-costs { display: inline-flex; gap: 6px; font-style: normal; }
+.cost-hp { color: #ff7a8a; font-style: normal; font-size: 12px; }
+.cost-gold { color: #ffd166; font-style: normal; font-size: 12px; }
+
+.quest-tracker { display: flex; flex-direction: column; gap: 6px; }
+.quest-chain {
+  border: 1px solid #3a3a55; border-radius: 8px; padding: 6px 8px; background: #23233a;
+}
+.quest-chain.resolved { border-color: #4cd964; opacity: .9; }
+.quest-chain.closed { opacity: .65; }
+.quest-chain-head { display: flex; justify-content: space-between; align-items: center; }
+.quest-chain-name { font-size: 13px; font-weight: 600; }
+.quest-status { font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+.q-open { background: #3a2f66; color: #cdb6ff; }
+.q-resolved { background: #1f4d2c; color: #8fffb0; }
+.q-closed { background: #3a3a44; color: #aaa; }
+.quest-chain-wait { font-size: 11px; color: #9a9ab5; }
+.quest-chain-choice { font-size: 11px; color: #ffb27a; }
+.replay-quests { margin-top: 8px; }

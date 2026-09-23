@@ -82,6 +82,25 @@ _enemy("boss_ancient", "远古守卫", 60, _defender_skills, "gold",
        ])
 
 
+# ---------------- 奇遇链伏击（2.8.0：只由跨章奇遇幕引用，不进地图普通池） ----------------
+_enemy("ambush_guardian", "护寺武僧", 40, [
+    {"name": "伏魔杖", "hint": "造成 10 伤害", "effects": [_hit(10)]},
+    {"name": "擒拿", "hint": "造成 6 伤害并施加易碎", "effects": [_hit(6), {
+        "type": "apply_status", "status": "fragile", "value": 1, "stack": "add", "ticks": 2,
+        "target": "player"}]},
+], "advanced", reward_cards=[], reward_gold=20, kind="ambush")
+
+_enemy("ambush_idol", "苏醒石像", 48, [
+    {"name": "重砸", "hint": "造成 11 伤害", "effects": [_hit(11)]},
+    {"name": "石化外壳", "hint": "获得 12 格挡", "effects": [_block(12)]},
+], "advanced", reward_cards=[], reward_gold=20, kind="ambush")
+
+_enemy("ambush_bandit", "商队弩手", 32, [
+    {"name": "连弩", "hint": "造成 5 伤害两次", "effects": [_hit(5), _hit(5)]},
+    {"name": "装填", "hint": "获得 6 格挡", "effects": [_block(6)]},
+], "basic", reward_cards=[], reward_gold=20, kind="ambush")
+
+
 def all_enemies():
     return [dict(v) for v in ENEMIES.values()]
 

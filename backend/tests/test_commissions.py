@@ -558,8 +558,9 @@ def test_no_claim_after_final_chapter_win(client):
 
 # ---------------- 续局与回放 ----------------
 # 合法行动机器人（商店优先，全程 API 行动；用于回放校验点逐位验证）
+# 2.8.0：event（奇遇）给中等偏好；机器人在奇遇节点选最后一个「无事/离开」项
 _BOT_PREF = {"shop": 0, "rest": 1, "reward": 2, "forge": 3,
-             "encounter": 4, "elite": 6, "boss": 7}
+             "event": 4, "encounter": 5, "elite": 6, "boss": 7}
 
 
 def _bot_clear_chapter(client, rid, cap=300, accept_commissions=True):
@@ -592,6 +593,14 @@ def _bot_clear_chapter(client, rid, cap=300, accept_commissions=True):
             for o in view["shop"]["commissions"]:
                 r = _accept(client, rid, o["sku"])
                 assert r.status_code == 200
+        # 2.8.0 奇遇抉择：机器人不追求奇遇收益，选最后一个「无事/离开」项安全通过
+        if view.get("quest_event") and view["quest_event"].get("kind") == "choice":
+            opts = view["quest_event"]["options"]
+            r = client.post(f"/api/runs/{rid}/act",
+                            json={"action": "quest_choose",
+                                  "option": len(opts) - 1})
+            assert r.status_code == 200
+            continue
         if not view["reward_claimed"] and view["reward_options"]:
             idx = next((i for i, o in enumerate(view["reward_options"])
                         if o.get("kind") == "gold"), 0)

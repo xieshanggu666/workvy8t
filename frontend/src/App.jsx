@@ -10,6 +10,8 @@ import DeckView from './components/DeckView.jsx'
 import CommissionPanel from './components/CommissionPanel.jsx'
 import PotionBelt from './components/PotionBelt.jsx'
 import CompanionPanel from './components/CompanionPanel.jsx'
+import QuestPanel from './components/QuestPanel.jsx'
+import QuestTracker from './components/QuestTracker.jsx'
 import ReplayPlayer from './components/ReplayPlayer.jsx'
 import ExpeditionReplay from './components/ExpeditionReplay.jsx'
 
@@ -292,6 +294,7 @@ export default function App() {
           <DeckView />
           {!view.in_battle && <PotionBelt />}
           <CompanionPanel />
+          <QuestTracker view={view} />
           <CommissionPanel />
           {view.unlocked_cards && <Unlocks unlocked={view.unlocked_cards} />}
         </div>
@@ -308,6 +311,7 @@ export default function App() {
           )}
           {hasReward && !ended && <RewardView view={view} />}
           {hasForge && !ended && <ForgeView view={view} />}
+          {!ended && !view.in_battle && <QuestPanel view={view} />}
           {showShop && !ended && <ShopView view={view} onClose={() => setShopDismissed(true)} />}
         </div>
       </div>

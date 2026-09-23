@@ -38,11 +38,14 @@ def _buggy_new_run_state(seed, carry, nxt, chapters_total, exp_id):
         expedition_id=exp_id)
     state["chapter"] = carry.get("chapter")
     state["rules_version"] = "2.3.0"
-    # 该夹具复刻 2.3 旧状态：伙伴与药水字段均尚未加入状态结构
+    # 该夹具复刻 2.3 旧状态：伙伴、药水与跨章奇遇（2.8.0）字段均尚未加入
     state.pop("companion", None)
     state.pop("potions", None)
+    state.pop("quests", None)
+    state.pop("quest_event", None)
     carry.pop("companion", None)
     carry.pop("potions", None)
+    carry.pop("quests", None)
     # create 校验点必须记录旧状态形状（含未迁移的章号）
     return state
 
@@ -61,7 +64,7 @@ def _buggy_advance(exp_id):
         state = _buggy_new_run_state(
             service._chapter_seed(row["seed"], nxt), carry, nxt,
             row["chapters_total"], exp_id)
-        map_data = service.mapgen.generate_map(state["seed"])
+        map_data = service.mapgen.generate_map(state["seed"], quest_events=False)
         legacy_ckpt = service.state_checkpoint(
             state, include_companion=False, include_potions=False)
         db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
@@ -91,9 +94,11 @@ def _buggy_act(run_id, action_dict):
         map_data = json.loads(row["map_json"])
         service._apply_action(state, action_dict["action"], action_dict,
                               map_data, grant_unlocks=False)
-        # 2.3 旧版没有伙伴/药水背包，也没有伙伴货架
+        # 2.3 旧版没有伙伴/药水背包/跨章奇遇，也没有伙伴货架
         state.pop("companion", None)
         state.pop("potions", None)
+        state.pop("quests", None)
+        state.pop("quest_event", None)
         if state.get("shop"):
             state["shop"].pop("companions", None)
             state["shop"].pop("potions", None)
@@ -252,8 +257,9 @@ def _buggy_clear_chapter(run_id, exp_id, chapter):
         reach = rec["map"]["routes"].get(st["position"], [])
         if not reach:
             return
+        # 2.8.0：奇遇节点机器人会选「无事/离开」项安全通过（见下方 quest 分支）
         pref = {"rest": 0, "reward": 1, "shop": 2, "forge": 3,
-                "encounter": 4, "elite": 6, "boss": 7}
+                "event": 4, "encounter": 5, "elite": 6, "boss": 7}
         node = sorted(reach, key=lambda n: pref.get(
             rec["map"]["nodes"][n]["type"], 9))[0]
         _buggy_act(run_id, {"action": "choose_node", "node": node})
@@ -396,7 +402,7 @@ def _buggy_chapter_state_from_carry(exp_id, carry, nxt, chapters_total, run_id=N
         state = _buggy_new_run_state(
             service._chapter_seed(row["seed"], nxt), carry, nxt,
             chapters_total, exp_id)
-        map_data = service.mapgen.generate_map(state["seed"])
+        map_data = service.mapgen.generate_map(state["seed"], quest_events=False)
         if conn.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
             conn.execute("DELETE FROM battle_events WHERE run_id=?", (run_id,))
             conn.execute(
@@ -545,8 +551,9 @@ def test_full_expedition_replay_of_buggy_save_isolated(client):
     rid1 = client.get(f"/api/expeditions/{exp_id}").json()["run"]["run_id"]
 
     def bot(rid):
+        # 2.8.0：奇遇节点机器人会选「无事/离开」项安全通过（见下方 quest 分支）
         pref = {"rest": 0, "reward": 1, "shop": 2, "forge": 3,
-                "encounter": 4, "elite": 6, "boss": 7}
+                "event": 4, "encounter": 5, "elite": 6, "boss": 7}
         for _ in range(300):
             view = client.get(f"/api/runs/{rid}/resume").json()
             if view["status"] != "in_progress":
@@ -564,6 +571,12 @@ def test_full_expedition_replay_of_buggy_save_isolated(client):
                     client.post(f"/api/runs/{rid}/act",
                                 json={"action": "commission_accept",
                                       "sku": o["sku"]})
+            if view.get("quest_event") and view["quest_event"].get("kind") == "choice":
+                # 2.8.0：本机器人不追求奇遇收益，选最后一个「无事/离开」项
+                opts = view["quest_event"]["options"]
+                client.post(f"/api/runs/{rid}/act",
+                            json={"action": "quest_choose", "option": len(opts) - 1})
+                continue
             if not view["reward_claimed"] and view["reward_options"]:
                 idx = next((i for i, o in enumerate(view["reward_options"])
                             if o.get("kind") == "gold"), 0)
@@ -621,8 +634,9 @@ def test_fixed_expedition_replay_still_strict(client):
 
     def win(rid):
         """合法打完章节（不瞬移）：rest/reward/shop 优先，战斗靠 strike。"""
+        # 2.8.0：奇遇节点机器人会选「无事/离开」项安全通过（见下方 quest 分支）
         pref = {"rest": 0, "reward": 1, "shop": 2, "forge": 3,
-                "encounter": 4, "elite": 6, "boss": 7}
+                "event": 4, "encounter": 5, "elite": 6, "boss": 7}
         for _ in range(300):
             view = client.get(f"/api/runs/{rid}/resume").json()
             if view["status"] != "in_progress":
@@ -641,6 +655,12 @@ def test_fixed_expedition_replay_still_strict(client):
                             if o.get("kind") == "gold"), 0)
                 client.post(f"/api/runs/{rid}/act",
                             json={"action": "claim_reward", "option": idx})
+                continue
+            if view.get("quest_event") and view["quest_event"].get("kind") == "choice":
+                # 2.8.0：不追求奇遇收益，选最后一个「无事/离开」项
+                opts = view["quest_event"]["options"]
+                client.post(f"/api/runs/{rid}/act",
+                            json={"action": "quest_choose", "option": len(opts) - 1})
                 continue
             reach = view["reachable"]
             node = sorted(reach, key=lambda n: pref.get(n["type"], 9))[0]

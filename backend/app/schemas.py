@@ -30,6 +30,9 @@ class ActRequest(BaseModel):
     slot: Optional[int] = None    # use_potion/discard_potion 动作用：药水背包格位（0 基）
     replace: Optional[int] = None  # 背满购买/领取药水时：被替换丢弃的格位（0 基）
     mode: Optional[str] = None    # companion_set_mode：accompany/rest
+    # 跨章奇遇链：quest_choose 在奇遇节点抉择（option 为选项下标；
+    # 代价/效果由服务端链定义权威结算，走 request_id 幂等）
+    # 注：option 字段与 claim_reward 共用，action 区分语义
     # 并发控制（可选，老客户端不带也完全兼容）：
     request_id: Optional[str] = None   # 客户端生成的请求令牌：同令牌重复提交返回首次结果
     expected_rev: Optional[int] = None  # 所依据视口的存档版本；过期提交 -> 409

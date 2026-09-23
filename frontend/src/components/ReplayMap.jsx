@@ -2,7 +2,7 @@ import React from 'react'
 
 const TYPE_LABEL = {
   encounter: '遭遇', elite: '精英', rest: '休息', reward: '奖励',
-  forge: '锻造', shop: '商店', boss: '首领', start: '营地',
+  forge: '锻造', shop: '商店', event: '奇遇', boss: '首领', start: '营地',
 }
 
 // 回放专用只读地图：不可点击推进；当前位置高亮，已访问节点（沿位置之前的行）标记。

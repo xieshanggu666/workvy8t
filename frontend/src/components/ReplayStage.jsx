@@ -8,7 +8,7 @@ import PotionBelt from './PotionBelt.jsx'
 
 const TYPE_LABEL = {
   encounter: '遭遇', elite: '精英', rest: '休息', reward: '奖励',
-  forge: '锻造', shop: '商店', boss: '首领', start: '营地',
+  forge: '锻造', shop: '商店', event: '奇遇', boss: '首领', start: '营地',
 }
 
 // 整局回放的单帧舞台：严格只读，不调用 api.act。
@@ -91,6 +91,7 @@ export default function ReplayStage({ view, showShop }) {
       {view.expedition && (view.commissions || []).length > 0 && (
         <CommissionsSnapshot commissions={view.commissions} />
       )}
+      {(view.quests || []).length > 0 && <QuestSnapshot quests={view.quests} />}
       {node?.type === 'forge' && <ForgeSnapshot view={view} />}
       {node?.type === 'reward' && <RewardSnapshot view={view} />}
       {showShop && view.shop && <ShopSnapshot view={view} />}
@@ -291,6 +292,27 @@ function ShopSnapshot({ view }) {
         )}
         <p className="shopdesc">移除服务：本次价格 {shop.remove.cost}，已用 {shop.remove.used} 次。</p>
       </div>
+    </div>
+  )
+}
+
+function QuestSnapshot({ quests }) {
+  const STATUS = { open: '进行中', resolved: '已了结', closed: '已结束' }
+  return (
+    <div className="panellist quest-tracker replay-quests">
+      <h3>🔮 奇遇链（回放帧）</h3>
+      {quests.map((q) => (
+        <div key={q.key} className={`quest-chain ${q.status}`}>
+          <div className="quest-chain-head">
+            <span className="quest-chain-name">{q.icon} {q.name}</span>
+            <span className={`quest-status q-${q.status}`}>{STATUS[q.status] || q.status}</span>
+          </div>
+          <div className="quest-chain-wait">{q.waiting}</div>
+          {q.status === 'open' && q.choice && (
+            <div className="quest-chain-choice">抉择：{q.choice}</div>
+          )}
+        </div>
+      ))}
     </div>
   )
 }
