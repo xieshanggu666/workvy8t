@@ -11,6 +11,7 @@ REST = "rest"
 REWARD = "reward"
 FORGE = "forge"
 SHOP = "shop"
+EVENT = "event"   # 2.8.0：跨章奇遇节点（抉择与代价，埋下的 flag 随远征继承）
 BOSS = "boss"
 
 # 行数（从起点到首领的节点段数）
@@ -68,6 +69,33 @@ def generate_map(seed):
     # 首领属性由 map 层携带；seed 亦用于重放
     nodes[boss] = {"id": boss, "type": BOSS, "row": ROWS, "enemy": "boss_ancient", "label": "远古守卫"}
     routes["boss"] = []
+
+    # 2.8.0：每张图确定性安放恰好一个「奇遇」节点。使用独立派生流选位（在主
+    # rng 全部抽完之后再抽），因此既有节点类型/敌人序列的确定性完全不变——
+    # 老种子重生成时原有节点逐位一致，只是多出一个被改写为奇遇的节点。
+    # 放在第 2~3 行（index 1..2）：既避开开局行，也保证无论玩家此前选哪条
+    # 路线都能抵达（行间路由是全连接的）。只替换战斗/奖励/锻造节点，绝不
+    # 替换商店/休息——商店数量与恢复点关系到既有地图拓扑与固定种子测试。
+    # 选位偏好「同行有同类型备份」的节点：去掉它后，从上一行任一节点仍能
+    # 抵达一个该类型节点（避免旧种子上唯一通路被改写）。
+    ev_rng = random.Random((seed * 131 + 17) & 0xFFFFFFFF)
+    grid = {(r, c): nodes[nid(r, c)] for r in (1, 2) for c in range(3)}
+    replaceable = {pos for pos, nd in grid.items()
+                   if nd["type"] in (ENCOUNTER, ELITE, REWARD, FORGE)}
+    redundant = []
+    for (r, c) in sorted(replaceable):
+        siblings = [grid[(r, k)]["type"] for k in range(3)
+                    if k != c and (r, k) in replaceable]
+        # 放宽：同一「类别」（战斗类/锻造/奖励）有备份即可
+        def kind_of(t):
+            return "battle" if t in (ENCOUNTER, ELITE) else t
+        if any(kind_of(t) == kind_of(grid[(r, c)]["type"]) for t in siblings):
+            redundant.append(nid(r, c))
+    ev_pool = redundant or [nid(r, c) for (r, c) in sorted(replaceable)]
+    ev_id = ev_rng.choice(ev_pool)
+    ev_node = nodes[ev_id]
+    ev_node["type"] = EVENT
+    ev_node.pop("enemy", None)
 
     return {
         "seed": seed, "start": start, "boss": boss, "rows": ROWS,

@@ -303,6 +303,20 @@ export default class BattleScene extends Phaser.Scene {
       await this.banner(`🛡️ ${entry.companion_turn.name || '伙伴'}协助攻击`, '#7be0c0', 320)
       return
     }
+    // 奇遇链：伏击战开场横幅 / 跨章预兆（力量·格挡·易碎）标记
+    if (entry.encounter_ambush) {
+      await this.banner(`⚔️ ${entry.encounter_ambush.name || '伏击'}`, '#e0a0ff', 420)
+      return
+    }
+    if (entry.encounter_opener) {
+      const parts = []
+      if (entry.encounter_opener.strength) parts.push(`力量 +${entry.encounter_opener.strength}`)
+      if (entry.encounter_opener.block) parts.push(`格挡 +${entry.encounter_opener.block}`)
+      if (entry.encounter_opener.fragile) parts.push(`易碎 ${entry.encounter_opener.fragile}`)
+      if (entry.encounter_opener.enemy_hp) parts.push(`敌方生命 +${entry.encounter_opener.enemy_hp}`)
+      await this.banner(`🔗 奇遇预兆${parts.length ? ` · ${parts.join(' / ')}` : ''}`, '#c084fc', 420)
+      return
+    }
     // 战斗结果（死亡动画 + 横幅），附带权威快照
     if (entry.result) {
       if (entry.result === 'won' || entry.result === 'run_won') {

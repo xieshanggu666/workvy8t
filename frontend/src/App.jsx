@@ -10,6 +10,8 @@ import DeckView from './components/DeckView.jsx'
 import CommissionPanel from './components/CommissionPanel.jsx'
 import PotionBelt from './components/PotionBelt.jsx'
 import CompanionPanel from './components/CompanionPanel.jsx'
+import EncounterView from './components/EncounterView.jsx'
+import EncounterFlags from './components/EncounterFlags.jsx'
 import ReplayPlayer from './components/ReplayPlayer.jsx'
 import ExpeditionReplay from './components/ExpeditionReplay.jsx'
 
@@ -205,6 +207,7 @@ export default function App() {
 
   const hasReward = !view.reward_claimed && view.reward_options && view.reward_options.length > 0
   const hasForge = view.forge_available === true
+  const hasEncounter = !view.in_battle && !!view.encounter
   const atShop = view.shop_available === true && view.shop
   const showShop = atShop && !shopDismissed
   const ended = view.status === 'won' || view.status === 'lost'
@@ -293,6 +296,7 @@ export default function App() {
           {!view.in_battle && <PotionBelt />}
           <CompanionPanel />
           <CommissionPanel />
+          <EncounterFlags />
           {view.unlocked_cards && <Unlocks unlocked={view.unlocked_cards} />}
         </div>
         <div className="maincol">
@@ -308,6 +312,7 @@ export default function App() {
           )}
           {hasReward && !ended && <RewardView view={view} />}
           {hasForge && !ended && <ForgeView view={view} />}
+          {hasEncounter && !ended && <EncounterView view={view} />}
           {showShop && !ended && <ShopView view={view} onClose={() => setShopDismissed(true)} />}
         </div>
       </div>

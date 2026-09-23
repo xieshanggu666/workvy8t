@@ -9,6 +9,7 @@ const TYPE_LABEL = {
   reward: '奖励',
   forge: '锻造',
   shop: '商店',
+  event: '奇遇',
   boss: '首领',
   start: '起点',
 }

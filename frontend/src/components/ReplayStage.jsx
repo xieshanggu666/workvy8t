@@ -8,7 +8,7 @@ import PotionBelt from './PotionBelt.jsx'
 
 const TYPE_LABEL = {
   encounter: '遭遇', elite: '精英', rest: '休息', reward: '奖励',
-  forge: '锻造', shop: '商店', boss: '首领', start: '营地',
+  forge: '锻造', shop: '商店', event: '奇遇', boss: '首领', start: '营地',
 }
 
 // 整局回放的单帧舞台：严格只读，不调用 api.act。
@@ -93,6 +93,8 @@ export default function ReplayStage({ view, showShop }) {
       )}
       {node?.type === 'forge' && <ForgeSnapshot view={view} />}
       {node?.type === 'reward' && <RewardSnapshot view={view} />}
+      {view.encounter && <EncounterSnapshot view={view} />}
+      {(view.encounter_flags || []).length > 0 && <EncounterFlagsSnapshot view={view} />}
       {showShop && view.shop && <ShopSnapshot view={view} />}
       {view.status === 'won' && <div className="replay-end won">🏆 本帧：通关</div>}
       {view.status === 'lost' && <div className="replay-end lost">💀 本帧：战败（回放不发放解锁）</div>}
@@ -209,6 +211,48 @@ function PotionBeltReadOnly({ view }) {
           </span>
         ))}
       </div>
+    </div>
+  )
+}
+
+function EncounterSnapshot({ view }) {
+  const enc = view.encounter
+  return (
+    <div className="overlay replay-overlay">
+      <div className="encountercard panel replay-panel">
+        <div className="enc-head">
+          <span className="enc-badge">✨ 跨章奇遇（回放）</span>
+          {view.expedition && <span className="enc-chapter">第 {view.expedition.chapter} 章</span>}
+        </div>
+        <h2>{enc.title}</h2>
+        <p className="enc-text">{enc.text}</p>
+        <div className="enc-choices">
+          {enc.choices.map((ch) => (
+            <span key={ch.id} className="enc-choice readonly">
+              <span className="enc-choice-label">{ch.label}</span>
+              <span className="enc-choice-desc">{ch.desc}</span>
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EncounterFlagsSnapshot({ view }) {
+  return (
+    <div className="panellist encounter-flags replay-enc-flags">
+      <h3>🔗 奇遇印记（回放）</h3>
+      {(view.encounter_flags || []).map((f) => (
+        <div key={f.flag} className={`enc-flag-row ${f.pending_opener ? 'pending' : ''}`}>
+          <b>{f.title}</b>
+          <span className="flag-desc">{f.desc}</span>
+          <span className="flag-meta">
+            始于第 {f.since_chapter} 章
+            {f.opener_at ? ` · 预兆已于第 ${f.opener_at} 章兑现` : ' · 预兆待兑现'}
+          </span>
+        </div>
+      ))}
     </div>
   )
 }

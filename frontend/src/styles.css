@@ -110,6 +110,8 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 .mnode.forge { border-color: #7fd1ff; }
 .mnode.shop { border-color: #5be0b0; }
 .mnode.rest { border-color: #4cd964; }
+.mnode.event { border-color: #c084fc; background: linear-gradient(160deg, #2a2140, #26263a); }
+.mnode.event .mlabel { color: #e0c8ff; }
 .mnode.boss { border-color: #e04850; }
 .mnode.reachable { color: #fff; box-shadow: 0 0 0 1px #7d3cff; cursor: pointer; }
 .mnode.cur { outline: 2px solid #ffd166; }
@@ -449,3 +451,45 @@ button.mini { font-size: 12px; padding: 4px 8px; }
   gap: 8px;
 }
 .battle-companion.down { opacity: .55; border-color: #704048; }
+
+/* 跨章节奇遇链（2.8.0） */
+.encountercard {
+  max-width: 640px; width: calc(100% - 48px); margin: 5vh auto; padding: 22px 26px;
+  border: 1px solid #6d4aa0; background: linear-gradient(165deg, #221d33, #1c1c2a);
+  box-shadow: 0 18px 60px rgba(0,0,0,.55);
+}
+.enc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.enc-badge {
+  font-size: 12px; color: #d9c2ff; background: #332552; border: 1px solid #6d4aa0;
+  padding: 3px 10px; border-radius: 999px; letter-spacing: .05em;
+}
+.enc-chapter { font-size: 12px; color: #98a; }
+.encountercard h2 { color: #e6d6ff; margin: 6px 0 10px; }
+.enc-text { color: #b9b0d0; line-height: 1.7; margin: 0 0 16px; }
+.enc-choices { display: flex; flex-direction: column; gap: 10px; }
+.enc-choice {
+  text-align: left; display: flex; flex-direction: column; gap: 5px;
+  background: #262238; border: 1px solid #4a3d70; border-radius: 10px;
+  padding: 12px 15px; color: #e8e2f5; cursor: pointer; transition: border-color .12s, transform .05s;
+}
+.enc-choice:not(.readonly):hover { border-color: #c084fc; transform: translateY(-1px); }
+.enc-choice.readonly { cursor: default; opacity: .92; }
+.enc-choice-label { font-weight: 700; color: #e6d6ff; }
+.enc-choice-desc { font-size: 13px; color: #a99fc4; line-height: 1.55; }
+.enc-active-flags { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.enc-flag { background: #332552; border-color: #6d4aa0; color: #d9c2ff; }
+.flag-soon { margin-left: 6px; color: #ffd166; font-style: normal; font-size: 11px; }
+.enc-replace { margin: 10px 0; }
+
+/* 侧栏奇遇印记 */
+.panellist.encounter-flags h3 { color: #c8a8ff; }
+.enc-flag-row {
+  border-left: 3px solid #6d4aa0; padding: 7px 10px; margin-bottom: 8px;
+  background: #221f30; border-radius: 0 8px 8px 0;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.enc-flag-row.pending { border-left-color: #ffd166; }
+.enc-flag-row b { color: #e0d2ff; font-size: 13px; }
+.enc-flag-row .flag-desc { font-size: 12px; color: #a99fc4; line-height: 1.5; }
+.enc-flag-row .flag-meta { font-size: 11px; color: #8c84a8; }
+.replay-enc-flags { margin-top: 10px; }

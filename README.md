@@ -22,6 +22,18 @@
   可在休息节点治疗。招募扣款、战斗伤害、负伤、治疗均走普通动作与统一结算队列；伙伴随章节交接快照继承，
   续局、整章/整程回放逐帧重建，2.6.0 之前旧档首次载入自动补 `companion:null` 并按 legacy 校验过渡
 - 构筑牌组、挑战精英/首领，奖励选择影响后续遭遇（遗物加伤、首领血量提升等）
+- **跨章节奇遇链（规则 2.8.0）**：每张地图确定性安放一个「奇遇」节点（独立派生流
+  选位、只替换战斗/奖励/锻造节点，商店与休息拓扑不变）；玩家在节点上面临剧情抉择
+  并立即承担代价（生命/金币）或获得奖励（卡牌/药水/遗物/最大生命）。部分抉择埋下
+  **印记 flag**——随远征交接快照继承，下一章开头兑现「预兆」（首场战斗开局修正：
+  敌方+血/开局力量·格挡/易碎，或开章赐福回血，一次性消耗）；后续章节的奇遇节点再按
+  flag 触发续写（旅人道谢赠遗物、复仇者伏击战），续写候选在场时必定触发。印记状态
+  （flags/opened/battle_mods/completed/pending/ambush）是 run 状态的一部分，抉择是
+  普通动作 `encounter_choice`（request_id 幂等 + expected_rev 状态守卫 + 单事务原子
+  提交：代价先校验、失败零副作用，双击只结算一次），结算回写牌组/遗物/药水/生命；
+  伏击战胜负与远征结算同动作提交（败即终结远征、推进讨伐委托）。续局保留待抉择/战斗，
+  逐章与整程回放逐位校验（旧 2.8.0 前存档首次载入补空 enc_state，旧 create 校验点
+  形状按缺字段候选兼容比对）
 - 卡牌效果统一经 **结算队列** 处理，支持连锁触发、状态叠加、死亡打断
 - **战斗演出**：Phaser 场景按服务端结算顺序逐条播放（待机/攻击/受击/死亡动画、护盾与状态实时刷新），
   播放期间操作锁定，播完再应用权威快照同步血量/护盾/手牌，战斗结束衔接领奖
@@ -102,12 +114,20 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
 休息节点治疗、跨章交接、续局与新旧回放校验、旧档补字段迁移）**、
 **格挡/援护结算顺序 2.7.0（卡牌格挡与壁垒药水在敌人行动段抵挡伤害、格挡不跨回合、
 援护只吃格挡穿透溢出；战斗中存档续局一致；2.6.1 历史战斗动作按 legacy_block 旧时序
-逐位重演、升级边界动作严格校验且最终帧与在线一致）**。
+逐位重演、升级边界动作严格校验且最终帧与在线一致）**、
+**跨章节奇遇链 2.8.0（每图恰好一个奇遇节点且不替换商店/休息、待抉择续局保留/
+离开失效/未知链与重复抉择拒绝、代价先校验（金币/生命/背满替换）失败零副作用、
+request_id 双击只结算一次、本地链发牌不埋 flag、单局不出跨章链且末章不出起始链、
+flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/易碎/赐福回血）只在首场
+战斗消耗一次、无续写 flag 兑现即移除而续写 flag 保留、续写候选优先必触发、
+伏击战胜利固定战利品并推进讨伐委托/破财清 flag/伏击败北终结远征、待抉择/伏击
+续局、两章合法流程逐章/整程回放第 2 章零 mismatch/error 且最终帧与在线一致、
+旧档补 enc_state 迁移与旧 create 8 形状候选兼容）**。
 
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
 - `GET  /api/runs/{id}/resume` 续局
-- `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove / use_potion / discard_potion / companion_set_mode / commission_accept / commission_claim）
+- `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove / use_potion / discard_potion / companion_set_mode / commission_accept / commission_claim / encounter_choice）
   - 可选并发字段：`request_id`（客户端为每个意图生成的令牌；同令牌重复/并发提交返回首次响应，
     响应里 `duplicate:true`，绝不重复执行）、`expected_rev`（所依据视口的存档版本号；
     存档已被推进则返回 409 状态冲突）。行动响应与 `/resume` 视口携带当前 `rev`。
@@ -232,6 +252,42 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
   `legacy_block` 旧时序（敌人行动前清格挡、按全额援护）逐位重演并按 legacy 呈现，
   首个 2.7.0+ 动作之前规则先行切换，边界动作严格校验，最终帧与在线存档逐位一致，
   续局、战斗中续局与整局/整程回放都不分叉。
+
+跨章节奇遇链（`app/encounters.py`，规则 2.8.0）：
+- 节点：地图由独立 RNG 派生流（`seed*131+17`）确定性安放恰好一个「奇遇」节点
+  （`type:"event"`，第 2~3 行），只从战斗/奖励/锻造节点中挑选、且优先挑同行有
+  同类备份的节点，因此商店/休息数量与唯一类型通路保持不变；既有节点类型/敌人的
+  抽取序列完全不受影响（新 RNG 在主 rng 抽完之后才取）。
+- 待抉择：`choose_node` 进入事件节点后 `enc_state.pending={chain,node}`，视口
+  `encounter` 下发 `{chain,title,text,choices[]}`；离开节点自动作废（地图无环）。
+  链由 `(章节种子,节点行,章号)` 确定性抽取——续写链（`continue:true`）候选非空时
+  必在续写中抽取，保证埋了 flag 的玩家走到后续章奇遇必遇续写；普通局
+  （`chapters_total=null`）只出本地链，末章不出跨章起始链；无候选时是兜底清泉。
+- 抉择：`{action:"encounter_choice", chain, enc_choice, replace?}`。代价
+  （cost.gold/cost.hp）先校验（金币不足/致命/药水背满未指定替换格 -> 400，零副作用），
+  再同事务落账；奖励类型与奖励/商店同构并扩展 `hp/max_health/relic_set/battle`。
+  重复抉择 400（pending 已清空），双击靠 request_id 返回首次响应（duplicate:true）。
+- flag 与预兆：抉择的 `set_flag` 写入 `enc_state.flags{flag:埋设章}` 并进入
+  `carry.enc_state`；开新章时 `on_chapter_begin(chapter)` 对「上一章埋下且未兑现」
+  的 flag 各兑现一次：`FLAG_OPENERS` 的 `battle`（strength/block/fragile/enemy_hp）
+  合并进 `battle_mods`、`heal` 叠加在 25% 休整回血之上；无续写链等待的 flag
+  （altar_*）兑现即移除，续写 flag（wt_*）保留到续写节点。战斗修正由本章首场
+  战斗一次性消费（`_build_battle` 在建场 start_turn 后施加，事件先于权威快照），
+  续局从 `battle` 快照恢复、不二次施加。
+- 续写：`avenger_ambush` 的「迎战」是**非节点伏击战**（敌人 avenger，26 血；
+  `_build_battle(node_data=None)`），不享受首领遗物加成但照常消耗本场可用的章节
+  预兆、伙伴、遗物开局；胜利固定发金币（无普通战利品/无领奖步骤）、推进讨伐委托，
+  战败走普通战败路径（远征 lost、委托全失败、失败解锁）；「破财」抉择直接扣钱结清。
+- 视口：`encounter`（待抉择）、`encounter_flags[]`（活跃印记：title/desc/
+  since_chapter/opener_at/pending_opener）；交接快照 carry 增加
+  `encounter_flags` 摘要。动作日志事件：`encounter_event`（进入/兜底）、
+  `encounter_choice`（抉择）、`encounter_ambush`（伏击开场横幅）、
+  `encounter_opener`（预兆施加）、`encounter_grant`（逐项奖励）、
+  `encounter_ambush_result`（伏击胜负），全部进入可交互回放时间轴（kind=encounter）。
+- 旧档：无 `enc_state` 字段时首次 `/resume`/`/act` 补 `fresh_state()`（结构迁移，
+  本步按 legacy）；旧 create 校验点回放时在 companion/potions/encounters 三个结构维
+  的 8 种形状候选中匹配（完整形状优先），缺 enc_state 的旧初态在首个 2.8.0+ 动作前
+  按 legacy 呈现、规则先行切换，之后严格校验。
 
 ## 设计要点
 - 所有战斗逻辑在服务端（唯一权威），客户端仅播放服务器返回的结算事件 → 续局/回放天然一致。

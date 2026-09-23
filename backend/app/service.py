@@ -15,6 +15,7 @@ from . import shop as shop_mod
 from . import commissions as commission_mod
 from . import potions as potions_mod
 from . import companions as companions_mod
+from . import encounters as enc_mod
 from .cards import all_cards, get_card
 from .engine import Battle, _statuses_public
 from .forging import FORGE_COST, effective_card, node_name, growth_node_cost, validate_unlock
@@ -57,10 +58,21 @@ from .settlement import EffectEvent, SettlementQueue
 #        新规则；回放 2.7.0 之前日志时对越过修复点之前的战斗动作启用旧时序
 #        （legacy_block：敌人行动前清格挡 + 按全额援护），历史动作逐位可重演，
 #        跨越修复点后严格校验，续局与回放不分叉。
-RULES_VERSION = "2.7.0"
+# 2.8.0：跨章节奇遇链——地图新增「奇遇」节点（每张图确定性安放一个，独立派生
+#        流选位，不改变既有节点类型/敌人的确定性），玩家在节点上面对抉择并
+#        立即承担代价或获得奖励；部分抉择埋下 flag，enc_state（flags/opened/
+#        battle_mods/completed/pending/ambush）进入 run 状态与远征交接快照，
+#        下一章开头兑现预兆（首场战斗开局修正/章节回血），后续章奇遇节点触发
+#        续写（报恩/复仇，含伏击战）。抉择是普通动作（encounter_choice，走
+#        request_id 幂等 + 状态守卫 + 统一事务），结算回写牌组/遗物/药水/生命；
+#        伏击战胜利发放固定战利品、战败终结远征。旧档无 enc_state 字段，首次
+#        载入补 fresh_state（结构迁移，本步按 legacy 处理）；旧 create 校验点
+#        形状缺该字段，回放候选按 include_encounters=False 比对兼容。
+RULES_VERSION = "2.8.0"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
 COMPANION_RULES_VERSION = "2.6.0"  # 伙伴字段进入 run 状态：更早日志的迁移步前按 legacy 比对
 BLOCK_RULES_VERSION = "2.7.0"  # 格挡/援护结算顺序修复：更早日志的战斗动作走旧时序重演
+ENCOUNTER_RULES_VERSION = "2.8.0"  # 奇遇链：enc_state 进入 run 状态与交接快照
 
 
 def _ver_lt(ver, baseline):
@@ -132,21 +144,34 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
             "max_health": 75, "health": 75, "base_energy": 3,
             "potions": [],
             "companion": None,
+            "enc_state": enc_mod.fresh_state(),
         }
         heal = 0
+        opener_heal = 0
     else:
         heal = max(1, int(carry.get("max_health", 75) * CHAPTER_CLEAR_HEAL_RATIO))
     instances = copy.deepcopy(carry["card_instances"])
     # 兼容旧章交接快照（2.3.0 之前的 carry 里可能是 forges 结构）
     _normalize_instances(instances)
     max_hp = carry.get("max_health", 75)
+    # 奇遇状态随交接快照继承；旧章快照缺字段（或整体缺失）时补全新结构
+    enc_state, _enc_norm = enc_mod.normalize_state(copy.deepcopy(carry.get("enc_state")))
+    chapter_for_enc = chapter if chapter is not None else carry.get("chapter")
+    if chapter_for_enc is not None and chapter_for_enc > 1:
+        # 进入新章：节点级痕迹清空（保留跨章 flag/已完成链），再兑现各 flag 的
+        # 一次性预兆。在线推进与回放重建共用本函数，逐位一致。
+        enc_mod.reset_for_chapter(enc_state)
+        opener_heal, _opened_flags = enc_mod.on_chapter_begin(enc_state, chapter_for_enc)
+    else:
+        opener_heal = 0
+    start_health = min(max_hp, max(1, carry.get("health", max_hp)) + heal + opener_heal)
     return {
         "seed": seed,
         "rules_version": RULES_VERSION,
         "status": "in_progress",
         "position": "start",
         "max_health": max_hp,
-        "health": min(max_hp, max(1, carry.get("health", max_hp)) + heal),
+        "health": start_health,
         "base_energy": carry.get("base_energy", 3),
         "deck": list(carry["deck"]),      # 手牌引用（uid）
         "card_instances": instances,      # uid -> {id, growth:[{node,cost}]}
@@ -157,6 +182,8 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         "potions": list(carry.get("potions", [])),
         # 伙伴：持久招募状态（id/mode/hp/wounded），随行/负伤随快照跨章继承
         "companion": copy.deepcopy(carry.get("companion")),
+        # 跨章节奇遇链状态：flag/预兆/伏击/已结清链随交接继承（2.8.0）
+        "enc_state": enc_state,
         # 远征委托：uid 单调发号器 + 委托实例（接取/进度/领奖/超期/战败失败）
         "next_commission_seq": carry.get("next_commission_seq", 1),
         "commissions": copy.deepcopy(carry.get("commissions", [])),
@@ -264,6 +291,15 @@ def _migrate_state(run):
     elif companion_changed:
         run["companion"] = companion
         changed = True
+    # 2.8.0：跨章节奇遇链状态（旧档无此字段：补全新结构，随本步原子落库）
+    if "enc_state" not in run:
+        run["enc_state"] = enc_mod.fresh_state()
+        changed = True
+    else:
+        enc_state, enc_changed = enc_mod.normalize_state(run["enc_state"])
+        run["enc_state"] = enc_state
+        if enc_changed:
+            changed = True
     return changed
 
 
@@ -314,6 +350,7 @@ def _carry_from_run(run):
         "base_energy": run.get("base_energy", 3),
         "potions": list(run.get("potions", [])),
         "companion": copy.deepcopy(run.get("companion")),
+        "enc_state": copy.deepcopy(run.get("enc_state")),
         "commissions": copy.deepcopy(run.get("commissions", [])),
         "next_commission_seq": run.get("next_commission_seq", 1),
         "chapter": run.get("chapter"),
@@ -353,6 +390,8 @@ def _carry_public(carry):
         "max_health": carry.get("max_health"),
         "potions": [potions_mod.public_potion(pid) for pid in carry.get("potions", [])],
         "companion": companions_mod.public_companion(carry.get("companion")),
+        "encounter_flags": enc_mod.flags_public(
+            carry.get("enc_state"), carry.get("chapter") or 0),
         "commissions": [
             commission_mod.commission_public(c, carry.get("chapter") or 0)
             for c in carry.get("commissions", [])
@@ -834,17 +873,30 @@ def _enemy_by_node(node_data):
 
 
 # ---------- 战斗绑定 ----------
-def _build_battle(run_state, node_data):
-    enemy_def = _enemy_by_node(node_data)
+def _build_battle(run_state, node_data, enemy_def_override=None):
+    """构造一场战斗。
+
+    - node_data 为地图节点（普通/精英/首领）；enemy_def_override 用于奇遇链
+      伏击战（非节点敌人，不享受首领遗物的 boss_hp_bonus）；
+    - 奇遇预兆 battle_mods 在本章首场战斗一次性消耗（敌人生命/开局力量·格挡·
+      易碎，由 enc_state 随交接继承）；本场是否首场只取决于修正是否仍在场——
+      消费动作本身就是状态推演，在线与回放逐位一致；
+    - 遗物「旅人的护符/先驱者徽章」每场战斗开局生效（力量/格挡）。
+    """
+    enemy_def = enemy_def_override or _enemy_by_node(node_data)
     relic = run_state["relics"]
     boss_hp_bonus = 0
-    if node_data["type"] == mapgen.BOSS and "boss_hp_bonus" in relic:
+    if node_data is not None and node_data.get("type") == mapgen.BOSS \
+            and "boss_hp_bonus" in relic:
         boss_hp_bonus = relic["boss_hp_bonus"]
+    # 奇遇链预兆：首场战斗开局修正（一次性，消费后清空）
+    opener_mods = enc_mod.take_battle_mods(run_state.get("enc_state"))
+    enemy_hp_bonus = opener_mods.pop("enemy_hp", 0)
     battle = Battle(
         {"max_health": run_state["max_health"], "health": run_state["health"],
          "deck": run_state["deck"], "relics": relic, "base_energy": run_state["base_energy"]},
         enemy_def, seed=run_state["seed"], battle_index=run_state["battle_index"],
-        boss_hp_bonus=boss_hp_bonus,
+        boss_hp_bonus=boss_hp_bonus, enemy_hp_bonus=enemy_hp_bonus,
         card_instances=run_state.get("card_instances", {}),
         companion_state=run_state.get("companion"),
     )
@@ -853,6 +905,19 @@ def _build_battle(run_state, node_data):
     # 按新格挡重演、承伤与历史校验点分叉。在线 run 不含该瞬态键，恒为新规则。
     battle.legacy_block = bool(run_state.get(_LEGACY_BLOCK_KEY))
     _snapshot, initial_log = battle.start_turn()
+    # 开局效果必须在权威快照【之前】施加：随后追加的 snapshot 才携带加成后的
+    # 力量/格挡/易碎状态，战斗中存档（battle.dump）与首帧视口逐位一致。
+    # 遗物开局：旅人的护符 +1 力量；先驱者徽章 +6 格挡（每场战斗）
+    relic_opener = {}
+    if relic.get("traveler_charm"):
+        relic_opener["strength"] = 1
+    if relic.get("vanguard_badge"):
+        relic_opener["block"] = 6
+    if relic_opener:
+        initial_log = initial_log + battle.apply_opener(relic_opener)
+    # 奇遇链预兆（可能为空）：标记 + 力量/格挡/易碎结算事件
+    if opener_mods:
+        initial_log = initial_log + battle.apply_opener(opener_mods)
     return battle, initial_log
 
 
@@ -974,6 +1039,8 @@ def act(run_id, action):
                 "slot": action.get("slot"),
                 "replace": action.get("replace"),
                 "mode": action.get("mode"),
+                "chain": action.get("chain"),
+                "enc_choice": action.get("enc_choice"),
                 "ver": RULES_VERSION, "ckpt": state_checkpoint(run),
             }
             if migrated:
@@ -1045,6 +1112,10 @@ def _apply_action(run, a, action, map_data, grant_unlocks=False):
                                   legacy_ignore_cap=action.get("_legacy_ignore_cap", False))
     if a == "commission_claim":
         return _commission_claim(run, action.get("commission"))
+    if a == "encounter_choice":
+        return _encounter_choice(run, action.get("chain"), action.get("enc_choice"),
+                                 replace=action.get("replace"),
+                                 grant_unlocks=grant_unlocks)
     raise InvalidAction(f"unknown action {a}")
 
 
@@ -1057,6 +1128,11 @@ def _choose_node(run, map_data, node, grant_unlocks=True):
     initial_log = []
     # 每进入一个新节点都清掉上个节点的商店库存（商店仅在其节点内有效）
     run["shop"] = None
+    # 奇遇抉择只在其奇遇节点内有效；地图是无环的（不存在重回旧节点），任何
+    # 进入新节点的动作都使上一节点未完成的待抉择失效（防止旧抉择跨节点提交）
+    enc = run.get("enc_state")
+    if enc and enc.get("pending"):
+        enc["pending"] = None
 
     t = node_data["type"]
     if t in (mapgen.ENCOUNTER, mapgen.ELITE, mapgen.BOSS):
@@ -1092,6 +1168,10 @@ def _choose_node(run, map_data, node, grant_unlocks=True):
         run["reward_options"] = rewards_mod.relic_choice_options(run["seed"] + run["battle_index"] * 7)
         run["reward_claimed"] = False
         run["forge_claimed"] = True
+    elif t == mapgen.EVENT:
+        # 奇遇节点（2.8.0）：按 (章节种子, 节点, 章号, 持有 flag/已完成链) 确定性
+        # 抽出一条链挂为待抉择；无候选则是兜底清泉（立即回复，节点结清）。
+        initial_log = _enter_encounter(run, node, node_data)
     elif t == mapgen.FORGE:
         # 锻造节点：进入即待锻造，玩家可花金币为一张牌选择强化分支（仅一次）
         run["in_battle"] = False
@@ -1285,6 +1365,183 @@ def _companion_set_mode(run, mode):
     return [{"companion_mode": companions_mod.public_companion(companion)}]
 
 
+# ---------- 跨章节奇遇链（2.8.0） ----------
+def _event_seed(run, node, node_data):
+    """奇遇链抽取种子：(章节种子, 节点行, 章号, 节点 id) 确定性派生。
+
+    与商店货架的盐值错开（*14009），但同属纯动作序列的函数——持有 flag/
+    已完成链参与候选集合，因此同一条动作日志重放必得同一条链。
+    """
+    return (run["seed"] * 14009 + node_data.get("row", 0) * 503
+            + (run.get("chapter") or 1) * 9173 + ord(node[0])) & 0xFFFFFFFF
+
+
+def _enter_encounter(run, node, node_data):
+    """进入奇遇节点：抽出待抉择链挂起；无候选时兜底清泉立即回复并结清节点。"""
+    enc = run.setdefault("enc_state", enc_mod.fresh_state())
+    run["in_battle"] = False
+    run["battle"] = None
+    run["reward_options"] = []
+    run["reward_claimed"] = True
+    run["forge_claimed"] = True
+    chain_id = enc_mod.select_chain(
+        _event_seed(run, node, node_data), enc,
+        run.get("chapter") or 1, run.get("chapters_total"))
+    log = []
+    if chain_id is None:
+        # 兜底：林间清泉，回复若干生命（满血则无事发生）
+        before = run["health"]
+        run["health"] = min(run["max_health"],
+                            run["health"] + enc_mod.FALLBACK_HEAL)
+        healed = run["health"] - before
+        enc_mod.mark_resolved(enc, node)
+        run["events_log"].append({"at": f"encounter:{node}", "chain": None,
+                                  "heal": healed})
+        log.append({"encounter_event": {
+            "chain": None, "title": enc_mod.FALLBACK_TITLE,
+            "text": enc_mod.FALLBACK_TEXT, "fallback": True, "heal": healed}})
+        return log
+    enc["pending"] = {"chain": chain_id, "node": node}
+    chain = enc_mod.get_chain(chain_id)
+    run["events_log"].append({"at": f"encounter:{node}", "chain": chain_id,
+                              "continue": bool(chain.get("continue"))})
+    log.append({"encounter_event": {
+        "chain": chain_id, "title": chain["title"], "text": chain["text"],
+        "continue": bool(chain.get("continue")),
+        "requires_flag": chain.get("requires_flag")}})
+    return log
+
+
+def _encounter_choice(run, chain_id, choice_id, replace=None, grant_unlocks=True):
+    """在奇遇节点提交抉择：校验 -> 代价/奖励结算 -> 埋 flag/结清/进入伏击。
+
+    幂等：待抉择只存在于当前奇遇节点；重复提交/离开节点后提交一律 409/400，
+    request_id 幂等保证双击只结算一次。代价在纯推演里先校验（金币/生命/背包），
+    失败整体回滚（act 事务），绝不出现“扣了钱没生效”。
+    """
+    if run.get("in_battle"):
+        raise InvalidAction("cannot resolve an encounter during battle")
+    if run["status"] != "in_progress":
+        raise InvalidAction("run already ended")
+    enc = run.get("enc_state")
+    pending = (enc or {}).get("pending")
+    if not pending:
+        raise InvalidAction("no pending encounter at this node")
+    if not chain_id or chain_id != pending.get("chain"):
+        raise InvalidAction("unknown encounter chain")
+    node = pending.get("node")
+    if node != run["position"]:
+        raise InvalidAction("encounter is no longer available")
+    chain = enc_mod.get_chain(chain_id)
+    try:
+        choice = enc_mod.get_choice(chain, choice_id)
+    except KeyError as e:
+        raise InvalidAction(str(e))
+    cost = choice.get("cost") or {}
+    # 代价校验先于任何变更（失败零副作用）
+    if run["gold"] < cost.get("gold", 0):
+        raise InvalidAction("not enough gold")
+    if run["health"] - cost.get("hp", 0) < 1:
+        raise InvalidAction("that cost would kill you")
+    # 药水奖励与战利品/商店同款：背满必须指定替换格（校验先于扣款，零副作用）
+    potion_eff = next((e for e in choice.get("effects", [])
+                       if e.get("type") == "add_potion"), None)
+    if potion_eff is not None and potions_mod.is_full(run.get("potions", [])):
+        n = len(run["potions"])
+        if not isinstance(replace, int) or not (0 <= replace < n):
+            raise InvalidAction("potion belt full; choose a slot to replace")
+    # ---- 扣除代价 ----
+    if cost.get("gold"):
+        run["gold"] -= cost["gold"]
+    if cost.get("hp"):
+        run["health"] = max(1, run["health"] - cost["hp"])
+    # ---- 抉择簿记（flag/已完成链/伏击挂起）必须先于效果，伏击判定取 effect ----
+    battle_eff = next((e for e in choice.get("effects", [])
+                       if e.get("type") == "battle"), None)
+    enc_mod.commit_choice(enc, chain, choice, run.get("chapter") or 1)
+    log = [{"encounter_choice": {
+        "chain": chain_id, "choice": choice_id, "label": choice["label"],
+        "cost": dict(cost), "flag": choice.get("set_flag"),
+        "battle": bool(battle_eff)}}]
+    if battle_eff is not None:
+        # 伏击战：清空待抉择、挂伏击上下文，随后建场（胜利战利品在战后发放）
+        enc["pending"] = None
+        return _start_ambush(run, chain, battle_eff, node, log,
+                             grant_unlocks=grant_unlocks)
+    # ---- 普通奖励结算 ----
+    for eff in choice.get("effects", []):
+        log.extend(_apply_encounter_effect(run, eff, replace))
+    enc["pending"] = None
+    is_local = chain["scope"] == enc_mod.LOCAL
+    enc_mod.mark_resolved(enc, node, chain_id=chain_id, local=is_local)
+    run["events_log"].append({
+        "at": f"encounter:{node}", "chain": chain_id, "choice": choice_id,
+        "flag": choice.get("set_flag"), "root": chain.get("root", chain_id),
+    })
+    return log
+
+
+def _apply_encounter_effect(run, eff, replace=None):
+    """抉择奖励：与奖励/商店效果同构，另加 hp/max_health/relic_set/battle。"""
+    t = eff["type"]
+    if t == "add_card":
+        uid = _add_card_instance(run, eff["card"])
+        return [{"encounter_grant": {"type": "card", "card": eff["card"], "uid": uid}}]
+    if t == "add_potion":
+        slot, discarded = _add_potion(run, eff["potion"], eff.get("replace", replace))
+        return [{"encounter_grant": {"type": "potion", "potion": eff["potion"],
+                                    "slot": slot, "discarded": discarded}}]
+    if t == "gold":
+        run["gold"] += eff["value"]
+        return [{"encounter_grant": {"type": "gold", "amount": eff["value"],
+                                    "gold": run["gold"]}}]
+    if t == "hp":
+        before = run["health"]
+        run["health"] = min(run["max_health"], run["health"] + eff["value"])
+        return [{"encounter_grant": {"type": "hp", "amount": run["health"] - before,
+                                    "health": run["health"]}}]
+    if t == "max_health":
+        run["max_health"] += eff["value"]
+        run["health"] += eff["value"]
+        return [{"encounter_grant": {"type": "max_health", "amount": eff["value"],
+                                    "max_health": run["max_health"],
+                                    "health": run["health"]}}]
+    if t == "relic_set":
+        rid = eff["relic"]
+        if rid in run["relics"]:
+            raise ShopSoldOut("relic already owned")
+        run["relics"][rid] = eff.get("value", 1)
+        return [{"encounter_grant": {"type": "relic", "relic": rid}}]
+    if t == "battle":
+        raise InvalidAction("battle effects are resolved via the ambush path")
+    raise InvalidAction(f"unknown encounter effect {t}")
+
+
+def _start_ambush(run, chain, battle_eff, node, log, grant_unlocks=True):
+    """奇遇伏击：立刻进入一场非节点战斗（敌人由链指定，胜利发固定战利品）。"""
+    enemy_def = enemies_mod.get_enemy(battle_eff["enemy"])
+    enc = run["enc_state"]
+    enc_mod.start_ambush(enc, chain, battle_eff, node)
+    run["in_battle"] = True
+    run["battle_index"] += 1
+    # 伏击不是地图节点：node_data=None 阻止 boss 遗物加成；本场仍可消耗章节首场
+    # 战斗的预兆修正（与普通战斗完全相同的构造路径，含伙伴/遗物开局）。
+    battle, companion_log = _build_battle(run, None, enemy_def_override=enemy_def)
+    log = list(companion_log) + log
+    log.insert(0, {"encounter_ambush": {
+        "enemy": enemy_def["id"], "name": enemy_def["name"],
+        "title": chain["title"], "root": chain.get("root", chain["id"])}})
+    if battle.battle_result() != "ongoing":
+        return _after_battle_step(run, battle, log, grant_unlocks=grant_unlocks)
+    run["battle"] = battle.dump()
+    run["health"] = battle.entities["player"]["hp"]
+    _sync_companion_from_battle(run, battle)
+    log.append({"snapshot": battle.to_snapshot()})
+    run["events_log"].append({"at": f"encounter:{node}", "ambush": enemy_def["id"],
+                              "battle": True})
+    return log
+
+
 def _after_battle_step(run, battle, log, grant_unlocks=True):
     snap = battle.to_snapshot()
     result = battle.battle_result()
@@ -1297,8 +1554,24 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
 
     # 战斗结束
     run["in_battle"] = False
+    # 奇遇伏击战上下文（若本场是伏击）：胜 -> 固定战利品 + 链结清；败 -> 普通战败
+    ambush = enc_mod.ambush_context(run.get("enc_state"))
     if result == "won":
         run["battle"] = None
+        if ambush is not None:
+            # 伏击胜利：根链完成/flag 清除，固定金币立即入账，不产生普通战利品
+            enc_mod.finish_ambush(run["enc_state"], True)
+            gold = ambush.get(enc_mod.AMBUSH_REWARD_KEY, 0)
+            run["gold"] += gold
+            run["reward_options"] = []
+            run["reward_claimed"] = True
+            log.append({"result": "won", "snapshot": snap})
+            log.append({"encounter_ambush_result": {
+                "won": True, "gold": gold, "gold_total": run["gold"]}})
+            # 伏击也算一场战斗胜利：委托讨伐目标照常推进
+            _progress_commissions(run, commission_mod.apply_battle_result(
+                run.get("commissions", []), True), log, "battle_win")
+            return log
         # 用当前节点敌人掉落生成奖励
         enemy = battle.enemy_def
         # 2.5.0 之前的旧战斗不出药水战利品：回放旧日志时按旧选项集重建，
@@ -1320,6 +1593,11 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
     else:
         run["battle"] = None
         run["status"] = "lost"
+        if ambush is not None:
+            # 伏击战败：链终止（flag 清除）；随后与普通战败完全一致——
+            # 远征章节伏击败北同样终结整段远征（由 _sync_expedition_conn 结算）
+            enc_mod.finish_ambush(run["enc_state"], False)
+            log.append({"encounter_ambush_result": {"won": False}})
         log.append({"result": "lost", "snapshot": snap})
         # 远征委托：战败则所有进行中委托立即失败
         _progress_commissions(run, commission_mod.apply_battle_result(
@@ -1585,6 +1863,9 @@ def _shop_buy(run, kind, sku, replace=None):
             r["gold"] -= price
             for eff in relic.get("effects", []):
                 _apply_option_effect(r, eff)
+            # 遗物必须登记入持有集合——纯消耗型遗物（如治疗药膏，效果只有
+            # heal_run）不会借 relic_set 自行登记，否则购买后视口/售罄判定丢失。
+            r["relics"].setdefault(rid, 1)
             next(it for it in r["shop"]["relics"] if it["sku"] == sku)["sold"] = True
             return {"relic": rid}
 
@@ -1795,16 +2076,21 @@ _CKPT_SKIP_KEYS = {
 }
 
 
-def state_checkpoint(run, include_companion=True, include_potions=True):
+def state_checkpoint(run, include_companion=True, include_potions=True,
+                     include_encounters=True):
     """权威状态校验点：对完整 run 状态取稳定哈希（SHA-256 截断 16 位）。
 
-    include_*=False 仅用于旧规则升级时的历史初态/迁移前哈希兼容。
+    include_*=False 仅用于旧规则升级时的历史初态/迁移前哈希兼容：
+    2.8.0 之前的 create 状态没有 enc_state，重放旧 create 事件时按
+    include_encounters=False 比对。
     """
     skip = set(_CKPT_SKIP_KEYS)
     if not include_companion:
         skip.add("companion")
     if not include_potions:
         skip.add("potions")
+    if not include_encounters:
+        skip.add("enc_state")
     material = {k: v for k, v in run.items() if k not in skip}
     blob = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -1829,10 +2115,11 @@ def _create_ckpt_candidates(seed, create_payload):
     recorded_ver = create_payload.get("ver")
     if recorded_ver:
         sim["rules_version"] = recorded_ver
-    full_ckpt = state_checkpoint(sim)
-    no_companion_ckpt = state_checkpoint(sim, include_companion=False)
-    no_potions_ckpt = state_checkpoint(sim, include_potions=False)
-    legacy_shape_ckpt = state_checkpoint(sim, include_companion=False, include_potions=False)
+
+    def _ckpt(state, comp, pot, enc):
+        return state_checkpoint(state, include_companion=comp,
+                                include_potions=pot, include_encounters=enc)
+
     buggy = None
     if carry is not None and chapter is not None and chapter > 1:
         buggy = _new_run_state(
@@ -1842,29 +2129,37 @@ def _create_ckpt_candidates(seed, create_payload):
             expedition_id=create_payload.get("expedition"))
         if recorded_ver:
             buggy["rules_version"] = recorded_ver
-    candidates = {
-        "full": (state_checkpoint(buggy) if buggy is not None else None, full_ckpt),
-        "no_companion": (state_checkpoint(buggy, include_companion=False)
-                         if buggy is not None else None, no_companion_ckpt),
-        "no_potions": (state_checkpoint(buggy, include_potions=False)
-                       if buggy is not None else None, no_potions_ckpt),
-        "legacy_shape": (state_checkpoint(buggy, include_companion=False, include_potions=False)
-                         if buggy is not None else None, legacy_shape_ckpt),
-    }
+    # 八种「字段形状」候选：companion（2.6.0）/potions（2.5.0）/encounters（2.8.0）
+    # 三个结构维各自是否参与哈希。录制的 create ckpt 命中哪种形状，本 run 回放
+    # 起点就按哪种形状对齐——旧版初态哈希逐位可比，首个当前版本动作之前按 legacy。
+    # 顺序至关重要：优先尝试「完整形状」，再逐维剥字段。否则一个字段齐全的哈希
+    # 可能恰好（结构等价/空默认值）与某个缺字段形状碰撞，导致 2.8.0 新档被误判
+    # 成「奇遇字段尚未引入」，后续每步的 enc_state 都被错误地排除出哈希。
+    shapes = []
+    for enc in (True, False):
+        for pot in (True, False):
+            for comp in (True, False):
+                name = ("full" if comp and pot and enc
+                        else f"c{int(comp)}p{int(pot)}e{int(enc)}")
+                buggy_hash = _ckpt(buggy, comp, pot, enc) if buggy is not None else None
+                shapes.append((name, comp, pot, enc, buggy_hash,
+                               _ckpt(sim, comp, pot, enc)))
     recorded = create_payload.get("ckpt") if not create_payload.get("_corrupt") else None
-    matched_shape = "full"
-    matched_buggy_ckpt = candidates["full"][0]
-    fixed_ckpt = full_ckpt
+    matched = shapes[0]  # 默认 full
     if recorded is not None:
-        for shape, (buggy_hash, fixed_hash) in candidates.items():
-            if recorded in (buggy_hash, fixed_hash):
-                matched_shape = shape
-                matched_buggy_ckpt = buggy_hash
-                fixed_ckpt = recorded
+        for shape in shapes:
+            if recorded in (shape[4], shape[5]):
+                matched = shape
                 break
-    pre_companion = matched_shape in ("no_companion", "legacy_shape")
-    pre_potions = matched_shape in ("no_potions", "legacy_shape")
-    return sim, fixed_ckpt, matched_buggy_ckpt, pre_companion, pre_potions
+    # 返回的三个布尔是「字段缺席」（pre-version，与既有 pre_companion/pre_potions
+    # 语义一致）：True 表示该 create 形状里没有该字段、首个新版动作之前按 legacy。
+    _name, has_companion, has_potions, has_enc, matched_buggy_ckpt, _ = matched
+    # create 帧实际比对值：录制值命中任一候选形状时直接用它（旧形状 create 帧
+    # 因此可标记 ok；受影响章的 create 由 create_of_legacy 另行豁免），录制值
+    # 缺失/全不匹配（损坏或规则漂移）时用完整形状哈希，让比对暴露 mismatch。
+    fixed_ckpt = recorded if recorded is not None else _ckpt(sim, True, True, True)
+    return (sim, fixed_ckpt, matched_buggy_ckpt,
+            not has_companion, not has_potions, not has_enc)
 
 
 def _replay_commission_maps(conn, exp_id, run_id):
@@ -1946,13 +2241,16 @@ def replay(run_id):
     )
     # 修复后正确初态 + 旧版错误初态两个候选：用记录的 create ckpt 识别受影响旧日志
     (sim, initial_ckpt, buggy_ckpt,
-     pre_companion_create, pre_potions_create) = _create_ckpt_candidates(seed, create_payload)
+     pre_companion_create, pre_potions_create, pre_enc_create) = _create_ckpt_candidates(
+        seed, create_payload)
     recorded_initial = (create_payload.get("ckpt")
                         if not create_payload.get("_corrupt") else None)
     pre_companion_replay = pre_companion_create
     pre_potions_replay = pre_potions_create
+    pre_enc_replay = pre_enc_create
     companion_migration_seen = not pre_companion_replay
     potions_migration_seen = not pre_potions_replay
+    enc_migration_seen = not pre_enc_replay
     # 2.7.0 格挡/援护顺序修复：无存档结构变更，create 形状无法区分新旧——
     # 统一按「首个 2.7.0+ 动作之前为旧时序」处理。在线路径上旧战斗中存档
     # 在玩家回合边界落库，升级后的首个动作（可能直接就是 end_turn）即按新
@@ -2040,12 +2338,19 @@ def replay(run_id):
         # 按旧格挡时序推演；本动作本身在线上已是修复后语义（规则先行切换）。
         crossing_block = (a != "create" and not block_rule_seen
                           and ver and not _ver_lt(ver, BLOCK_RULES_VERSION))
+        # 2.8.0 奇遇链结构（enc_state 进入 run 状态/交接快照）：旧 create 形状
+        # 缺该字段，首个 2.8.0+ 动作之前先补全新状态（与在线 _migrate_state 对齐）。
+        crossing_enc = (a != "create" and pre_enc_replay
+                        and not enc_migration_seen
+                        and ver and not _ver_lt(ver, ENCOUNTER_RULES_VERSION))
         # 受影响旧日志的修复点（2.4.0 跨章章号错位）：首个当前版本事件之前一切
         # 按 legacy 修复路径重放；越过该点后恢复严格校验。
         at_fix_point = (legacy_chapter and not post_fix and a != "create"
                         and (migrated_step or (ver and not _ver_lt(ver, RULES_VERSION))
-                             or crossing_companion or crossing_potions or crossing_block))
-        if at_fix_point or crossing_companion or crossing_potions or crossing_block:
+                             or crossing_companion or crossing_potions
+                             or crossing_block or crossing_enc))
+        if (at_fix_point or crossing_companion or crossing_potions
+                or crossing_block or crossing_enc):
             if crossing_companion:
                 companion_migration_seen = True
                 sim.pop(_LEGACY_NO_COMPANION_KEY, None)
@@ -2054,12 +2359,15 @@ def replay(run_id):
                 potions_migration_seen = True
                 sim.pop(_LEGACY_NO_POTIONS_KEY, None)
                 sim.setdefault("potions", [])
+            if crossing_enc:
+                enc_migration_seen = True
+                sim["enc_state"] = enc_mod.fresh_state()
             if crossing_block:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
         if at_fix_point:
             post_fix = True
-            # 2.4.0 修复点会同时越过伙伴/药水迁移（首个当前版本事件不可能早于它们）
+            # 2.4.0 修复点会同时越过伙伴/药水/奇遇迁移（首个当前版本事件不可能早于它们）
             if not companion_migration_seen:
                 companion_migration_seen = True
                 sim.pop(_LEGACY_NO_COMPANION_KEY, None)
@@ -2068,6 +2376,9 @@ def replay(run_id):
                 potions_migration_seen = True
                 sim.pop(_LEGACY_NO_POTIONS_KEY, None)
                 sim.setdefault("potions", [])
+            if not enc_migration_seen:
+                enc_migration_seen = True
+                sim["enc_state"] = enc_mod.fresh_state()
             if not block_rule_seen:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
@@ -2082,6 +2393,8 @@ def replay(run_id):
                               and a != "create")
         pre_potions_step = (pre_potions_replay and not potions_migration_seen
                             and a != "create")
+        pre_enc_step = (pre_enc_replay and not enc_migration_seen
+                        and a != "create")
         # 仍处于旧格挡时序区间的步骤（2.7.0 修复点之前）：同一动作在旧时序下
         # 的落库状态与新推演不同（格挡/承伤/伙伴生命），按 legacy 呈现并跳过
         # 哈希比对；动作仍经 legacy_block 旧时序逐位重演。纯规则修复、无结构
@@ -2096,9 +2409,10 @@ def replay(run_id):
         is_legacy = not ver
         skip_ckpt = (corrupt_row or migrated_step or pre_repair
                      or create_of_legacy or pre_companion_step or pre_potions_step
-                     or pre_block_step)
+                     or pre_block_step or pre_enc_step)
         if (is_legacy or migrated_step or pre_repair or create_of_legacy
-                or pre_companion_step or pre_potions_step or pre_block_step):
+                or pre_companion_step or pre_potions_step or pre_block_step
+                or pre_enc_step):
             legacy_steps += 1
         if pre_repair:
             repaired_steps += 1
@@ -2138,9 +2452,16 @@ def replay(run_id):
                 # 仍在旧结构区间时，动作产生的商店库存也必须保持旧形状
                 # （伙伴/药水货架是随字段升级才加入的规则产物；战后药水战利品
                 # 已在 _after_battle_step 按 include_potions 旧规则不生成）。
-                if sim.get("shop") and not companion_migration_seen:
+                # 注意：这里以【本步录制版本】为准，而不是字段迁移标记——2.4.0
+                # 单局的 create 形状已含 potions 键（结构早在 2.5.0 之前的某版
+                # 补入），但 2.4.0 动作生成的商店确实没有药水货架，必须照剥。
+                step_pre_companion = (ver and _ver_lt(ver, COMPANION_RULES_VERSION)) \
+                    or (not ver and not companion_migration_seen)
+                step_pre_potions = (ver and _ver_lt(ver, "2.5.0")) \
+                    or (not ver and not potions_migration_seen)
+                if sim.get("shop") and step_pre_companion:
                     sim["shop"].pop("companions", None)
-                if sim.get("shop") and not potions_migration_seen:
+                if sim.get("shop") and step_pre_potions:
                     sim["shop"].pop("potions", None)
             except Exception as e:  # 损坏/越权动作不抹掉整段回放：断在此步并标注
                 error = f"{type(e).__name__}: {e}"
@@ -2154,6 +2475,7 @@ def replay(run_id):
             sim,
             include_companion=not pre_companion_step,
             include_potions=not pre_potions_step,
+            include_encounters=not pre_enc_step,
         )
         if error:
             status = "error"
@@ -2183,7 +2505,7 @@ def replay(run_id):
             "check": status,
             "legacy": (is_legacy or migrated_step or pre_repair
                        or create_of_legacy or pre_companion_step or pre_potions_step
-                       or pre_block_step),
+                       or pre_block_step or pre_enc_step),
             "migrated": migrated_step,
             "repaired": pre_repair,
             "error": error,
@@ -2230,9 +2552,13 @@ def _step_result(log):
 
 def _step_kind(sim, action, payload, log):
     if action == "choose_node":
+        if any(isinstance(x, dict) and x.get("encounter_event") for x in log):
+            return "encounter"
         return "battle_entry" if sim.get("in_battle") else "route"
     if action in ("play", "end_turn", "use_potion"):
         return "battle"
+    if action == "encounter_choice":
+        return "encounter"
     if action == "claim_reward":
         return "reward"
     if action == "forge":
@@ -2255,7 +2581,8 @@ def _node_label(map_data, node):
         return ""
     nd = map_data["nodes"].get(node)
     labels = {"encounter": "遭遇", "elite": "精英", "rest": "休息", "reward": "奖励",
-              "forge": "锻造", "shop": "商店", "boss": "首领", "start": "营地"}
+              "forge": "锻造", "shop": "商店", "boss": "首领", "start": "营地",
+              "event": "奇遇"}
     return labels.get((nd or {}).get("type"), node)
 
 
@@ -2270,6 +2597,10 @@ def _step_title(sim, map_data, action, payload, log):
         return "建局"
     if action == "choose_node":
         node = payload.get("node")
+        ev = next((x.get("encounter_event") for x in log
+                   if isinstance(x, dict) and x.get("encounter_event")), None)
+        if ev and not ev.get("fallback"):
+            return f"奇遇：{ev.get('title') or _node_label(map_data, node)}"
         return f"前往{_node_label(map_data, node)}节点"
     if action == "play":
         inst = sim.get("card_instances", {}).get(payload.get("card"))
@@ -2315,6 +2646,13 @@ def _step_title(sim, map_data, action, payload, log):
     if action == "companion_set_mode":
         mode = payload.get("mode")
         return "伙伴随行" if mode == companions_mod.ACCOMPANY else "伙伴休整"
+    if action == "encounter_choice":
+        ch = next((x.get("encounter_choice") for x in log
+                   if isinstance(x, dict) and x.get("encounter_choice")), None)
+        if ch:
+            ambush = any(isinstance(x, dict) and x.get("encounter_ambush") for x in log)
+            return f"奇遇抉择：{ch.get('label')}" + ("（伏击战开始）" if ambush else "")
+        return "奇遇抉择"
     return action
 
 
@@ -2381,6 +2719,47 @@ def _step_summary(action, payload, log):
         return f"丢弃药水「{d['name']}」" if d else "丢弃药水"
     if action == "companion_set_mode":
         return "随行参战" if payload.get("mode") == companions_mod.ACCOMPANY else "休整待命；休息节点可治疗"
+    if action == "choose_node" and payload.get("node"):
+        ev = next((x.get("encounter_event") for x in log
+                   if isinstance(x, dict) and x.get("encounter_event")), None)
+        if ev:
+            if ev.get("fallback"):
+                return f"林间清泉：回复 {ev.get('heal', 0)} 点生命"
+            return ev.get("title", "奇遇")
+    if action == "encounter_choice":
+        ch = next((x.get("encounter_choice") for x in log
+                   if isinstance(x, dict) and x.get("encounter_choice")), None)
+        parts = []
+        if ch:
+            cost = ch.get("cost") or {}
+            if cost.get("gold"):
+                parts.append(f"支付 {cost['gold']} 金币")
+            if cost.get("hp"):
+                parts.append(f"失去 {cost['hp']} 点生命")
+        grants = [x.get("encounter_grant") for x in log
+                  if isinstance(x, dict) and x.get("encounter_grant")]
+        for g in grants:
+            if g["type"] == "gold":
+                parts.append(f"获得 {g['amount']} 金币")
+            elif g["type"] == "hp":
+                parts.append(f"回复 {g['amount']} 生命")
+            elif g["type"] == "max_health":
+                parts.append(f"最大生命 +{g['amount']}")
+            elif g["type"] == "card":
+                parts.append(f"获得卡牌「{_card_name(g['card'])}」")
+            elif g["type"] == "potion":
+                parts.append(f"获得药水（{g['slot'] + 1} 格）")
+            elif g["type"] == "relic":
+                parts.append(f"获得遗物 {g['relic']}")
+        amb = next((x.get("encounter_ambush_result") for x in log
+                    if isinstance(x, dict) and x.get("encounter_ambush_result")), None)
+        if ch and ch.get("battle") and amb is None:
+            parts.append("进入伏击战")
+        if amb:
+            parts.append(f"伏击{'胜利，缴获 ' + str(amb.get('gold', 0)) + ' 金币' if amb.get('won') else '失败'}")
+        if ch and ch.get("flag"):
+            parts.append(f"埋下预兆「{ch['flag']}」（随远征继承）")
+        return "；".join(parts)
     if action == "choose_node" and payload.get("node"):
         return f"位置 → {payload['node']}"
     return ""
@@ -2493,6 +2872,10 @@ def _public_view(run, map_data, run_id, include_unlocks=True, rev=None, expediti
             for c in run.get("commissions", [])
         ],
         "commission_kinds": commission_mod.public_commission_kinds(),
+        # 跨章节奇遇链（2.8.0）：当前节点待抉择链 + 活跃 flag（侧栏展示预兆）
+        "encounter": enc_mod.pending_public(run.get("enc_state")),
+        "encounter_flags": enc_mod.flags_public(
+            run.get("enc_state"), run.get("chapter") or 1),
         "in_battle": run["in_battle"],
         "battle": snap,
         "reachable": [map_data["nodes"][n] for n in reachable],

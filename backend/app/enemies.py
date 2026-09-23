@@ -63,6 +63,12 @@ _enemy("elite_warlord", "战团长", 45, [
     {"name": "横扫", "hint": "造成 8 伤害两次", "effects": [_hit(8), _hit(8)]},
 ], "gold", reward_cards=["battle_trance"], reward_gold=50)
 
+# ---------------- 奇遇：拦路复仇者（非节点伏击，战利品由奇遇链固定发放） ----------------
+_enemy("avenger", "负伤旅人的复仇者", 26, [
+    {"name": "短刀突刺", "hint": "造成 7 伤害", "effects": [_hit(7)]},
+    {"name": "缠斗", "hint": "造成 4 伤害两次", "effects": [_hit(4), _hit(4)]},
+], "advanced", reward_cards=[], reward_gold=0, kind="encounter")
+
 # ---------------- 首领（多阶段） ----------------
 _defender_skills = [
     {"name": "尾锤", "hint": "造成 14 伤害", "effects": [_hit(14)]},

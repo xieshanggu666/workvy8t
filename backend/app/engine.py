@@ -28,13 +28,16 @@ class Battle:
     """单场战斗：玩家 vs 一个敌人/首领。resolve 消费结算队列，产出事件日志。"""
 
     def __init__(self, run_state, enemy_def, seed, battle_index, relic_status="", relic_power=0, boss_hp_bonus=0,
-                 card_instances=None, companion_state=None):
+                 card_instances=None, companion_state=None, enemy_hp_bonus=0):
         max_hp = run_state["max_health"]
         self.entities = {
             "player": make_entity("player", run_state.get("player_name", "勇者"), max_hp, run_state["health"]),
         }
-        if boss_hp_bonus:
-            enemy_hp = enemy_def["hp"] + boss_hp_bonus
+        # 敌方生命加成：遗物首领加成（仅首领节点）与奇遇链预兆（enemy_hp_bonus，
+        # 章节首场战斗一次性消耗）叠加。
+        total_hp_bonus = boss_hp_bonus + enemy_hp_bonus
+        if total_hp_bonus:
+            enemy_hp = enemy_def["hp"] + total_hp_bonus
         else:
             enemy_hp = enemy_def["hp"]
         enemy_key = "enemy"
@@ -81,7 +84,48 @@ class Battle:
         # 2.7.0 之前历史日志回放标志：旧格挡时序（敌人行动前清格挡）与旧援护
         # 顺序（按全额伤害抵挡）仅在重放旧动作时开启；在线新档恒为 False。
         self.legacy_block = False
+        # 2.8.0 奇遇链预兆：首场战斗开局修正（start_turn 之后由 service 施加，
+        # 随首帧快照落库，战斗中续局/回放不需要再次施加）。
+        self.opener = None
         self.queue = SettlementQueue(self)
+
+    def apply_opener(self, mods):
+        """施加奇遇链预兆的开局修正（建场首回合抽牌之后调用，一次性）。
+
+        mods: {"strength": N, "block": N, "fragile": N, "vulnerable": N}
+        - strength：永久力量（本场战斗，ticks=None）；
+        - block：开局格挡，持续整个敌方行动段，下回合开始清零；
+        - fragile/vulnerable：施加给玩家、持续 N 回合的负面状态。
+        返回结算事件日志（供前端首帧动画逐条播放）。
+        """
+        if not mods:
+            return []
+        self.opener = dict(mods)
+        q = SettlementQueue(self)
+        if mods.get("strength"):
+            q.push(EffectEvent("apply_status", target="player",
+                               value=mods["strength"], source="encounter",
+                               tags=["encounter", "opener"],
+                               extra={"status": "strength", "stack": "add"}))
+        if mods.get("fragile"):
+            q.push(EffectEvent("apply_status", target="player",
+                               value=mods["fragile"], source="encounter",
+                               tags=["encounter", "opener"],
+                               extra={"status": "fragile", "stack": "add",
+                                      "ticks": mods.get("fragile")}))
+        if mods.get("vulnerable"):
+            q.push(EffectEvent("apply_status", target="player",
+                               value=mods["vulnerable"], source="encounter",
+                               tags=["encounter", "opener"],
+                               extra={"status": "vulnerable", "stack": "add",
+                                      "ticks": mods.get("vulnerable")}))
+        if mods.get("block"):
+            q.push(EffectEvent("gain_block", target="player",
+                               value=mods["block"], source="encounter",
+                               tags=["encounter", "opener"]))
+        log = q.run()
+        self.truncated = self.truncated or q.truncated
+        return [{"encounter_opener": dict(mods)}, *log]
 
     # ---------- 卡牌实例 ----------
     def _card_def(self, ref):
